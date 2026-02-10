@@ -1,0 +1,252 @@
+[
+  {
+    "id": "auth_31",
+    "name": "Author auth_31",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_32",
+    "name": "Author auth_32",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_40",
+    "name": "Author auth_40",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_48",
+    "name": "Author auth_48",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_13",
+    "name": "Author auth_13",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_39",
+    "name": "Author auth_39",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_26",
+    "name": "Author auth_26",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_6",
+    "name": "Author auth_6",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_19",
+    "name": "Author auth_19",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_43",
+    "name": "Author auth_43",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_29",
+    "name": "Author auth_29",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_12",
+    "name": "Author auth_12",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_44",
+    "name": "Author auth_44",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_50",
+    "name": "Author auth_50",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_10",
+    "name": "Author auth_10",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_8",
+    "name": "Author auth_8",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_22",
+    "name": "Author auth_22",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_47",
+    "name": "Author auth_47",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_4",
+    "name": "Author auth_4",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_49",
+    "name": "Author auth_49",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_27",
+    "name": "Author auth_27",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_21",
+    "name": "Author auth_21",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_25",
+    "name": "Author auth_25",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_2",
+    "name": "Author auth_2",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_35",
+    "name": "Author auth_35",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_41",
+    "name": "Author auth_41",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_17",
+    "name": "Author auth_17",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_5",
+    "name": "Author auth_5",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_28",
+    "name": "Author auth_28",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_45",
+    "name": "Author auth_45",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_20",
+    "name": "Author auth_20",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_42",
+    "name": "Author auth_42",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_16",
+    "name": "Author auth_16",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_7",
+    "name": "Author auth_7",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_3",
+    "name": "Author auth_3",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_37",
+    "name": "Author auth_37",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_18",
+    "name": "Author auth_18",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_46",
+    "name": "Author auth_46",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_33",
+    "name": "Author auth_33",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_38",
+    "name": "Author auth_38",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_24",
+    "name": "Author auth_24",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_30",
+    "name": "Author auth_30",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_9",
+    "name": "Author auth_9",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_23",
+    "name": "Author auth_23",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_36",
+    "name": "Author auth_36",
+    "department": "AI Lab"
+  },
+  {
+    "id": "auth_15",
+    "name": "Author auth_15",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_34",
+    "name": "Author auth_34",
+    "department": "Cloud"
+  },
+  {
+    "id": "auth_14",
+    "name": "Author auth_14",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_11",
+    "name": "Author auth_11",
+    "department": "Hardware"
+  },
+  {
+    "id": "auth_1",
+    "name": "Author auth_1",
+    "department": "AI Lab"
+  }
+]
