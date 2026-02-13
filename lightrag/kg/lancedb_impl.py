@@ -391,6 +391,7 @@ class LanceDBVectorStorage(BaseVectorStorage):
                 "vector_db_storage_cls_kwargs"
             )
         self.cosine_better_than_threshold = cosine_threshold
+        self._metric = kwargs.get("lancedb_metric", "cosine")
         self._table_name = self.final_namespace
         self._max_batch_size = self.global_config.get("embedding_batch_num", 10)
 
@@ -441,11 +442,8 @@ class LanceDBVectorStorage(BaseVectorStorage):
             query_vector = embedding[0].tolist()
 
         try:
-            results = (
-                await self._table.search(query_vector)
-                .limit(top_k)
-                .to_list()
-            )
+            search_builder = await self._table.search(query_vector)
+            results = await search_builder.distance_type(self._metric).limit(top_k).to_list()
         except Exception as e:
             logger.error(f"[{self.workspace}] Error in vector query: {e}")
             return []
