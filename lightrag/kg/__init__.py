@@ -5,6 +5,7 @@ STORAGE_IMPLEMENTATIONS = {
             "RedisKVStorage",
             "PGKVStorage",
             "MongoKVStorage",
+            "LanceDBKVStorage",
         ],
         "required_methods": ["get_by_id", "upsert"],
     },
@@ -15,6 +16,7 @@ STORAGE_IMPLEMENTATIONS = {
             "PGGraphStorage",
             "MongoGraphStorage",
             "MemgraphStorage",
+            "LanceDBGraphStorage",
         ],
         "required_methods": ["upsert_node", "upsert_edge"],
     },
@@ -27,6 +29,7 @@ STORAGE_IMPLEMENTATIONS = {
             "QdrantVectorDBStorage",
             "MongoVectorDBStorage",
             # "ChromaVectorDBStorage",
+            "LanceDBVectorStorage",
         ],
         "required_methods": ["query", "upsert"],
     },
@@ -36,6 +39,7 @@ STORAGE_IMPLEMENTATIONS = {
             "RedisDocStatusStorage",
             "PGDocStatusStorage",
             "MongoDocStatusStorage",
+            "LanceDBDocStatusStorage",
         ],
         "required_methods": ["get_docs_by_status"],
     },
@@ -91,6 +95,11 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
         "MONGO_URI",
         "MONGO_DATABASE",
     ],
+    # LanceDB Storage Implementations (LANCEDB_URI has default value)
+    "LanceDBKVStorage": [],
+    "LanceDBVectorStorage": [],
+    "LanceDBGraphStorage": [],
+    "LanceDBDocStatusStorage": [],
 }
 
 # Storage implementation module mapping
@@ -116,6 +125,10 @@ STORAGES = {
     "FaissVectorDBStorage": ".kg.faiss_impl",
     "QdrantVectorDBStorage": ".kg.qdrant_impl",
     "MemgraphStorage": ".kg.memgraph_impl",
+    "LanceDBKVStorage": ".kg.lancedb_impl",
+    "LanceDBVectorStorage": ".kg.lancedb_impl",
+    "LanceDBGraphStorage": ".kg.lancedb_impl",
+    "LanceDBDocStatusStorage": ".kg.lancedb_impl",
 }
 
 
