@@ -1613,7 +1613,7 @@ class LanceDBDocStatusStorage(DocStatusStorage):
             "content_summary": str(v.get("content_summary", "")),
             "content_length": content_length,
             "file_path": str(v.get("file_path", "")),
-            "status": str(v.get("status", "")),
+            "status": v["status"].value if hasattr(v.get("status"), "value") else str(v.get("status", "")),
             "created_at": str(v.get("created_at", "")),
             "updated_at": str(v.get("updated_at", "")),
             "track_id": str(v.get("track_id", "") or ""),
