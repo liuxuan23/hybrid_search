@@ -134,10 +134,16 @@ class ClientManager:
     async def release_client(cls, db):
         async with cls._lock:
             if db is not None and db is cls._instances["db"]:
-                cls._instances["ref_count"] -= 1
-                if cls._instances["ref_count"] == 0:
-                    cls._instances["db"] = None
-                    logger.debug("Released LanceDB connection (ref_count=0)")
+                if cls._instances["ref_count"] > 0:
+                    cls._instances["ref_count"] -= 1
+                    if cls._instances["ref_count"] == 0:
+                        cls._instances["db"] = None
+                        logger.debug("Released LanceDB connection (ref_count=0)")
+                else:
+                    logger.warning(
+                        "release_client called but ref_count already <= 0. "
+                        "This may indicate a double-release or initialization issue."
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,12 +193,22 @@ class LanceDBKVStorage(BaseKVStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client()
-            self._table = await get_or_create_table(
-                self.db, self._table_name, KV_SCHEMA
-            )
-            logger.debug(
-                f"[{self.workspace}] Use LanceDB as KV {self._table_name}"
-            )
+            try:
+                self._table = await get_or_create_table(
+                    self.db, self._table_name, KV_SCHEMA
+                )
+                logger.debug(
+                    f"[{self.workspace}] Use LanceDB as KV {self._table_name}"
+                )
+            except Exception as e:
+                # If table creation fails, clean up the connection
+                if self.db is not None:
+                    await ClientManager.release_client(self.db)
+                    self.db = None
+                logger.error(
+                    f"[{self.workspace}] Failed to initialize KV storage {self._table_name}: {e}"
+                )
+                raise
 
     async def finalize(self):
         if self.db is not None:
@@ -390,6 +406,15 @@ class LanceDBVectorStorage(BaseVectorStorage):
                 "cosine_better_than_threshold must be specified in "
                 "vector_db_storage_cls_kwargs"
             )
+        # Validate cosine_threshold is a number in [0, 1]
+        if not isinstance(cosine_threshold, (int, float)):
+            raise ValueError(
+                f"cosine_better_than_threshold must be a number, got {type(cosine_threshold).__name__}"
+            )
+        if not (0 <= cosine_threshold <= 1):
+            raise ValueError(
+                f"cosine_better_than_threshold must be in [0, 1], got {cosine_threshold}"
+            )
         self.cosine_better_than_threshold = cosine_threshold
         self._metric = kwargs.get("lancedb_metric", "cosine")
         self._table_name = self.final_namespace
@@ -415,13 +440,23 @@ class LanceDBVectorStorage(BaseVectorStorage):
             if self.db is None:
                 self.db = await ClientManager.get_client()
 
-            schema = self._build_vector_schema()
-            self._table = await get_or_create_table(
-                self.db, self._table_name, schema
-            )
-            logger.debug(
-                f"[{self.workspace}] Use LanceDB as VDB {self._table_name}"
-            )
+            try:
+                schema = self._build_vector_schema()
+                self._table = await get_or_create_table(
+                    self.db, self._table_name, schema
+                )
+                logger.debug(
+                    f"[{self.workspace}] Use LanceDB as VDB {self._table_name}"
+                )
+            except Exception as e:
+                # If table creation fails, clean up the connection
+                if self.db is not None:
+                    await ClientManager.release_client(self.db)
+                    self.db = None
+                logger.error(
+                    f"[{self.workspace}] Failed to initialize vector storage {self._table_name}: {e}"
+                )
+                raise
 
     async def finalize(self):
         if self.db is not None:
@@ -734,15 +769,28 @@ class LanceDBGraphStorage(BaseGraphStorage):
             if self.db is None:
                 self.db = await ClientManager.get_client()
 
-            self._node_table = await get_or_create_table(
-                self.db, self._node_table_name, GRAPH_NODE_SCHEMA
-            )
-            self._edge_table = await get_or_create_table(
-                self.db, self._edge_table_name, GRAPH_EDGE_SCHEMA
-            )
-            logger.debug(
-                f"[{self.workspace}] Use LanceDB as KG {self._node_table_name}"
-            )
+            try:
+                self._node_table = await get_or_create_table(
+                    self.db, self._node_table_name, GRAPH_NODE_SCHEMA
+                )
+                self._edge_table = await get_or_create_table(
+                    self.db, self._edge_table_name, GRAPH_EDGE_SCHEMA
+                )
+                logger.debug(
+                    f"[{self.workspace}] Use LanceDB as KG {self._node_table_name}"
+                )
+            except Exception as e:
+                # If table creation fails, clean up the connection
+                if self.db is not None:
+                    await ClientManager.release_client(self.db)
+                    self.db = None
+                # Reset table references to ensure clean state
+                self._node_table = None
+                self._edge_table = None
+                logger.error(
+                    f"[{self.workspace}] Failed to initialize graph storage {self._node_table_name}: {e}"
+                )
+                raise
 
     async def finalize(self):
         if self.db is not None:
@@ -1495,12 +1543,22 @@ class LanceDBDocStatusStorage(DocStatusStorage):
         async with get_data_init_lock():
             if self.db is None:
                 self.db = await ClientManager.get_client()
-            self._table = await get_or_create_table(
-                self.db, self._table_name, DOC_STATUS_SCHEMA
-            )
-            logger.debug(
-                f"[{self.workspace}] Use LanceDB as DocStatus {self._table_name}"
-            )
+            try:
+                self._table = await get_or_create_table(
+                    self.db, self._table_name, DOC_STATUS_SCHEMA
+                )
+                logger.debug(
+                    f"[{self.workspace}] Use LanceDB as DocStatus {self._table_name}"
+                )
+            except Exception as e:
+                # If table creation fails, clean up the connection
+                if self.db is not None:
+                    await ClientManager.release_client(self.db)
+                    self.db = None
+                logger.error(
+                    f"[{self.workspace}] Failed to initialize DocStatus storage {self._table_name}: {e}"
+                )
+                raise
 
     async def finalize(self):
         if self.db is not None:
