@@ -1,15 +1,20 @@
 """
-LanceDB unified storage implementation for LightRAG.
+LanceDB 统一存储实现，为 LightRAG 提供持久化后端。
 
-This module provides four storage backends using LanceDB:
-- LanceDBKVStorage: Key-value storage using JSON blob columns
-- LanceDBVectorStorage: Vector storage with native LanceDB vector search
-- LanceDBGraphStorage: Graph storage using dual-table (nodes + edges) approach
-- LanceDBDocStatusStorage: Document status storage with fixed schema
+本模块基于 LanceDB 实现四种存储：
+- LanceDBKVStorage:   KV 存储，使用 JSON  blob 列存放文档（text_chunks、full_docs 等）
+- LanceDBVectorStorage: 向量存储，用于实体、关系、文档块的 embedding 检索
+- LanceDBGraphStorage:  图存储，双表结构（nodes + edges）实现知识图谱
+- LanceDBDocStatusStorage: 文档状态存储，固定 schema 追踪文档处理进度
 
-Environment Variables:
-    LANCEDB_URI: Path to LanceDB database (default: "./lancedb")
-    LANCEDB_WORKSPACE: Override workspace name for all LanceDB storage instances
+数据隔离：
+    - namespace: 数据类型（如 text_chunks、entities），区分存储用途
+    - workspace: 工作空间，实现多租户/多项目隔离
+    - 最终表名: "{workspace}_{namespace}" 或 "{namespace}"（workspace 为空时）
+
+环境变量：
+    LANCEDB_URI: LanceDB 数据库路径（默认: "./lancedb"）
+    LANCEDB_WORKSPACE: 覆盖所有存储实例的 workspace（用于部署时统一指定）
 """
 
 import json
@@ -49,24 +54,24 @@ import pyarrow as pa  # type: ignore
 
 
 # ---------------------------------------------------------------------------
-# Helper functions
+# 辅助函数：构建 LanceDB 的 WHERE 子句
 # ---------------------------------------------------------------------------
 
 
 def _escape_sql_string(s: str) -> str:
-    """Escape single quotes for LanceDB SQL-like where clauses."""
+    """转义单引号，防止 SQL 注入。用于构建 LanceDB 的 where 条件。"""
     return s.replace("'", "''")
 
 
 def _build_where_eq(field_name: str, value: str) -> str:
-    """Build a WHERE clause for equality: field = 'value'."""
+    """构建 WHERE 等值条件: `field` = 'value'。用于单条记录查询。"""
     return f"`{field_name}` = '{_escape_sql_string(value)}'"
 
 
 def _build_where_in(field_name: str, values: list[str]) -> str:
-    """Build a WHERE clause for IN: field IN ('v1', 'v2', ...)."""
+    """构建 IN 条件: field IN ('v1', 'v2', ...)。空列表返回 1=0（恒假）。"""
     if not values:
-        return "1 = 0"  # Always false
+        return "1 = 0"  # 恒假，避免查询空列表
     escaped = [f"'{_escape_sql_string(v)}'" for v in values]
     return f"`{field_name}` IN ({', '.join(escaped)})"
 
@@ -74,7 +79,7 @@ def _build_where_in(field_name: str, values: list[str]) -> str:
 async def get_or_create_table(
     db: lancedb.AsyncConnection, table_name: str, schema: pa.Schema
 ):
-    """Open an existing LanceDB table or create a new empty one."""
+    """获取已存在的表，若不存在则按 schema 创建。用于各存储的 initialize 阶段。"""
     table_names = await db.table_names()
     if table_name in table_names:
         return await db.open_table(table_name)
@@ -85,7 +90,7 @@ async def get_or_create_table(
 
 
 def _compute_effective_workspace(workspace: str, env_var: str = "LANCEDB_WORKSPACE"):
-    """Compute effective workspace considering environment variable override."""
+    """计算实际生效的 workspace。若设置 LANCEDB_WORKSPACE 环境变量则覆盖传入参数。"""
     lancedb_workspace = os.environ.get(env_var)
     if lancedb_workspace and lancedb_workspace.strip():
         effective_workspace = lancedb_workspace.strip()
@@ -101,22 +106,25 @@ def _compute_effective_workspace(workspace: str, env_var: str = "LANCEDB_WORKSPA
 
 
 def _build_final_namespace(effective_workspace: str, namespace: str) -> str:
-    """Build final namespace with workspace prefix for data isolation."""
+    """生成最终表名：有 workspace 时为 {workspace}_{namespace}，否则为 namespace。"""
     if effective_workspace:
         return f"{effective_workspace}_{namespace}"
     return namespace
 
 
 # ---------------------------------------------------------------------------
-# Connection Manager
+# 连接管理：单例 + 引用计数，多存储实例共享同一连接
 # ---------------------------------------------------------------------------
 
 
 class ClientManager:
-    """Singleton LanceDB connection manager with reference counting."""
+    """
+    LanceDB 连接单例管理器，支持引用计数。
+    多个存储实例共享同一连接，ref_count 归零时才真正释放。
+    """
 
     _instances: dict[str, Any] = {"db": None, "ref_count": 0}
-    _lock = asyncio.Lock()
+    _lock = asyncio.Lock()  # 保护并发下的 ref_count 与连接创建/释放
 
     @classmethod
     async def get_client(cls) -> lancedb.AsyncConnection:
@@ -147,13 +155,13 @@ class ClientManager:
 
 
 # ---------------------------------------------------------------------------
-# KV Schema
+# KV 存储：PyArrow Schema，所有 KV 表共用此结构
 # ---------------------------------------------------------------------------
 
 KV_SCHEMA = pa.schema(
     [
-        pa.field("_id", pa.utf8(), nullable=False),
-        pa.field("data", pa.large_utf8()),
+        pa.field("_id", pa.utf8(), nullable=False),  # 主键
+        pa.field("data", pa.large_utf8()),           # JSON 序列化的文档
         pa.field("create_time", pa.int64()),
         pa.field("update_time", pa.int64()),
     ]
@@ -161,7 +169,7 @@ KV_SCHEMA = pa.schema(
 
 
 # ---------------------------------------------------------------------------
-# LanceDBKVStorage
+# LanceDBKVStorage：存储 text_chunks、full_docs、llm_cache 等 JSON 文档
 # ---------------------------------------------------------------------------
 
 
@@ -258,6 +266,7 @@ class LanceDBKVStorage(BaseKVStorage):
             return [None] * len(ids)
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
+        """返回 keys 中「不存在于存储中」的 ID 集合，用于增量 upsert 前的去重。"""
         if not keys:
             return set()
         try:
@@ -312,6 +321,7 @@ class LanceDBKVStorage(BaseKVStorage):
                 }
             )
 
+        # merge_insert: 按 _id 存在则更新，不存在则插入（upsert 语义）
         try:
             (
                 await self._table.merge_insert("_id")
@@ -367,7 +377,7 @@ class LanceDBKVStorage(BaseKVStorage):
 
 
 # ---------------------------------------------------------------------------
-# LanceDBVectorStorage
+# LanceDBVectorStorage：实体、关系、文档块的向量存储，支持 cosine/L2/dot
 # ---------------------------------------------------------------------------
 
 
@@ -421,7 +431,7 @@ class LanceDBVectorStorage(BaseVectorStorage):
         self._max_batch_size = self.global_config.get("embedding_batch_num", 10)
 
     def _build_vector_schema(self) -> pa.Schema:
-        """Build PyArrow schema for vector table dynamically based on meta_fields."""
+        """根据 meta_fields 动态构建向量表 schema，含 _id、vector、created_at 及 meta 列。"""
         fields = [
             pa.field("_id", pa.utf8(), nullable=False),
             pa.field(
@@ -483,8 +493,7 @@ class LanceDBVectorStorage(BaseVectorStorage):
             logger.error(f"[{self.workspace}] Error in vector query: {e}")
             return []
 
-        # LanceDB returns _distance for cosine metric (distance = 1 - similarity)
-        # Filter by cosine threshold and format results
+        # LanceDB cosine 返回 _distance（1 - 相似度），需转换为 score 并按阈值过滤
         formatted = []
         for doc in results:
             distance = doc.get("_distance", 1.0)
@@ -516,6 +525,7 @@ class LanceDBVectorStorage(BaseVectorStorage):
             }
             for k, v in data.items()
         ]
+        # 按 batch 大小分批 embedding，避免单次请求过大
         contents = [v["content"] for v in data.values()]
         batches = [
             contents[i : i + self._max_batch_size]
@@ -573,8 +583,9 @@ class LanceDBVectorStorage(BaseVectorStorage):
             )
 
     async def delete_entity_relation(self, entity_name: str) -> None:
+        """删除与该实体相关的所有关系向量（作为 src 或 tgt 的关系）。"""
         try:
-            # Find relations where entity appears as source or target
+            # 查找 entity 作为 src 或 tgt 的所有关系
             src_clause = _build_where_eq("src_id", entity_name)
             tgt_clause = _build_where_eq("tgt_id", entity_name)
             where = f"({src_clause}) OR ({tgt_clause})"
@@ -690,7 +701,7 @@ class LanceDBVectorStorage(BaseVectorStorage):
 
 
 # ---------------------------------------------------------------------------
-# Graph Storage Schemas
+# 图存储 Schema：节点表 + 边表，双表实现知识图谱
 # ---------------------------------------------------------------------------
 
 GRAPH_NODE_SCHEMA = pa.schema(
@@ -723,18 +734,18 @@ GRAPH_EDGE_SCHEMA = pa.schema(
     ]
 )
 
-# Separator used to build deterministic edge keys
+# 边 ID 分隔符，用于生成无向边的确定性 key（A-B 与 B-A 同一条边）
 _EDGE_KEY_SEP = "||"
 
 
 def _make_edge_id(src: str, tgt: str) -> str:
-    """Create a deterministic edge ID regardless of direction (undirected)."""
+    """生成无向边 ID：对 src、tgt 排序后拼接，保证 A-B 与 B-A 映射到同一 ID。"""
     a, b = sorted([src, tgt])
     return f"{a}{_EDGE_KEY_SEP}{b}"
 
 
 # ---------------------------------------------------------------------------
-# LanceDBGraphStorage
+# LanceDBGraphStorage：知识图谱存储，节点表 + 边表，支持 BFS 子图查询
 # ---------------------------------------------------------------------------
 
 
@@ -800,7 +811,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             self._edge_table = None
 
     # ------------------------------------------------------------------
-    # Basic Queries
+    # 基础查询：节点/边存在性
     # ------------------------------------------------------------------
 
     async def has_node(self, node_id: str) -> bool:
@@ -829,7 +840,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             return False
 
     # ------------------------------------------------------------------
-    # Degrees
+    # 度数：节点的边数量（作为 source 或 target 的边均计入）
     # ------------------------------------------------------------------
 
     async def node_degree(self, node_id: str) -> int:
@@ -853,7 +864,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
         return src_degree + tgt_degree
 
     # ------------------------------------------------------------------
-    # Getters
+    # 批量读取：节点、边、邻居
     # ------------------------------------------------------------------
 
     async def get_node(self, node_id: str) -> dict[str, str] | None:
@@ -894,6 +905,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
     async def get_node_edges(
         self, source_node_id: str
     ) -> list[tuple[str, str]] | None:
+        """获取与节点相连的所有边（作为 source 或 target 的边），返回 (src, tgt) 列表。"""
         try:
             src_clause = _build_where_eq("source_node_id", source_node_id)
             tgt_clause = _build_where_eq("target_node_id", source_node_id)
@@ -931,6 +943,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             return {}
 
     async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
+        """批量获取节点度数，返回 {node_id: degree}，用于按度数排序/裁剪。"""
         if not node_ids:
             return {}
         try:
@@ -960,11 +973,13 @@ class LanceDBGraphStorage(BaseGraphStorage):
     async def get_nodes_edges_batch(
         self, node_ids: list[str]
     ) -> dict[str, list[tuple[str, str]]]:
+        """批量获取多节点的关联边，返回 {node_id: [(src, tgt), ...]}。边两端任一在 node_ids 内即计入。"""
         if not node_ids:
             return {}
         result = {nid: [] for nid in node_ids}
         try:
             node_ids_set = set(node_ids)
+            # 查询 source 或 target 在 node_ids 中的边（双向关联）
             src_clause = _build_where_in("source_node_id", node_ids)
             tgt_clause = _build_where_in("target_node_id", node_ids)
             where = f"({src_clause}) OR ({tgt_clause})"
@@ -974,6 +989,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
                 .select(["source_node_id", "target_node_id"])
                 .to_list()
             )
+            # 将每条边归属到其两端在 node_ids 中的节点（同一条边可能计入两个节点）
             for edge in edges:
                 src = edge["source_node_id"]
                 tgt = edge["target_node_id"]
@@ -990,7 +1006,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             return result
 
     # ------------------------------------------------------------------
-    # Upserts
+    # 写入：节点、边的 upsert（存在则更新，不存在则插入）
     # ------------------------------------------------------------------
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
@@ -1074,7 +1090,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             raise
 
     # ------------------------------------------------------------------
-    # Deletion
+    # 删除：节点及其关联边，或仅删除边
     # ------------------------------------------------------------------
 
     async def delete_node(self, node_id: str) -> None:
@@ -1117,7 +1133,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             logger.error(f"[{self.workspace}] Error removing edges: {e}")
 
     # ------------------------------------------------------------------
-    # Query / Knowledge Graph
+    # 子图查询：BFS 遍历、按度数裁剪、构建 KnowledgeGraph
     # ------------------------------------------------------------------
 
     async def get_all_labels(self) -> list[str]:
@@ -1136,6 +1152,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
     def _construct_graph_node(
         self, node_id: str, node_data: dict
     ) -> KnowledgeGraphNode:
+        """将 LanceDB 节点行转为 KnowledgeGraphNode。剔除 _id/source_ids/_rowid 后其余字段作为 properties。"""
         return KnowledgeGraphNode(
             id=node_id,
             labels=[node_id],
@@ -1178,11 +1195,29 @@ class LanceDBGraphStorage(BaseGraphStorage):
         max_depth: int,
         max_nodes: int,
     ) -> KnowledgeGraph:
-        """Perform BFS traversal from given nodes, collecting nodes up to max_depth."""
+        """
+        从起始节点做双向 BFS 遍历，逐层扩展子图。
+
+        算法说明：
+        - 每层先查询当前层节点数据并加入 result，再通过边表找到下一层邻居，递归遍历。
+        - 「双向」指边的 source 和 target 都视为邻接：节点 A 与 B 有边则互为邻居。
+        - 通过 seen_nodes 去重，通过 max_depth/max_nodes 控制遍历范围。
+
+        Args:
+            node_labels: 当前层待处理的节点 ID 列表。
+            seen_nodes: 已访问节点集合，调用方传入，本函数会修改。
+            result: 累积的 KnowledgeGraph，本函数会追加 nodes。
+            depth: 当前深度（0 为起始层）。
+            max_depth: 最大遍历深度，超过则停止。
+            max_nodes: 最多收集的节点数，超过则停止。
+
+        Returns:
+            更新后的 result（就地修改，返回值便于递归）。
+        """
         if depth > max_depth or len(result.nodes) > max_nodes:
             return result
 
-        # Fetch node data for the current layer
+        # 1. 查询当前层节点数据，加入 result
         if node_labels:
             nodes_data = (
                 await self._node_table.query()
@@ -1199,7 +1234,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
                     if len(result.nodes) > max_nodes:
                         return result
 
-        # Find neighbors via edges
+        # 2. 查找与当前层节点相连的边（source 或 target 在 node_labels 内）
         src_clause = _build_where_in("source_node_id", node_labels)
         tgt_clause = _build_where_in("target_node_id", node_labels)
         where = f"({src_clause}) OR ({tgt_clause})"
@@ -1210,6 +1245,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             .to_list()
         )
 
+        # 3. 收集下一层邻居（边两端中尚未访问的节点）
         neighbor_nodes = []
         for edge in edges:
             if edge["source_node_id"] not in seen_nodes:
@@ -1217,6 +1253,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             if edge["target_node_id"] not in seen_nodes:
                 neighbor_nodes.append(edge["target_node_id"])
 
+        # 4. 递归遍历下一层
         if neighbor_nodes:
             result = await self._bidirectional_bfs_nodes(
                 neighbor_nodes, seen_nodes, result, depth + 1, max_depth, max_nodes
@@ -1227,7 +1264,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
     async def get_knowledge_graph_all_by_degree(
         self, max_depth: int, max_nodes: int
     ) -> KnowledgeGraph:
-        """Get knowledge graph for all nodes, prioritized by degree."""
+        """获取全图子图，按节点度数排序后取 top max_nodes，用于 node_label='*' 的全局查询。"""
         result = KnowledgeGraph()
         seen_edges = set()
 
@@ -1292,7 +1329,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
         return result
 
     async def _fetch_edges_between_nodes(self, node_ids: list[str]) -> list[dict]:
-        """Fetch edges where both source and target are in node_ids."""
+        """获取两端节点都在 node_ids 内的边（用于子图构建）。"""
         if not node_ids:
             return []
         try:
@@ -1310,6 +1347,21 @@ class LanceDBGraphStorage(BaseGraphStorage):
         max_depth: int = 3,
         max_nodes: int = None,
     ) -> KnowledgeGraph:
+        """
+        获取知识图谱子图。支持两种模式：
+
+        - node_label == "*"：全局模式，按节点度数取 top max_nodes，再取这些节点之间的边。
+        - 否则：单点模式，从 node_label 出发 BFS 收集节点，再补充节点之间的边。
+
+        Args:
+            node_label: 起始节点 ID；"*" 表示全局模式。
+            max_depth: BFS 最大深度（仅单点模式有效）。
+            max_nodes: 最多返回的节点数，受 global_config.max_graph_nodes 约束。
+
+        Returns:
+            含 nodes 和 edges 的 KnowledgeGraph，is_truncated 表示是否被裁剪。
+        """
+        # 确定 max_nodes：优先使用 global_config 的上限
         if max_nodes is None:
             max_nodes = self.global_config.get("max_graph_nodes", 1000)
         else:
@@ -1322,18 +1374,19 @@ class LanceDBGraphStorage(BaseGraphStorage):
 
         try:
             if node_label == "*":
+                # 全局模式：按度数取 top 节点及其间边
                 result = await self.get_knowledge_graph_all_by_degree(
                     max_depth, max_nodes
                 )
             else:
-                # Bidirectional BFS
+                # 单点模式：从 node_label 出发做 BFS 子图
                 seen_nodes: set[str] = set()
                 seen_edges: set[str] = set()
                 result = await self._bidirectional_bfs_nodes(
                     [node_label], seen_nodes, result, 0, max_depth, max_nodes
                 )
 
-                # Fetch edges among all discovered nodes
+                # BFS 只收集了节点，此处补充「已发现节点之间」的边
                 all_node_ids = list(seen_nodes)
                 if all_node_ids:
                     edges = await self._fetch_edges_between_nodes(all_node_ids)
@@ -1388,8 +1441,9 @@ class LanceDBGraphStorage(BaseGraphStorage):
             return []
 
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
+        """按度数排序返回最热门的 limit 个节点 ID，用于推荐/采样。"""
         try:
-            # Get all edges and compute node degrees in application layer
+            # 取全部边后在内存中统计度数
             all_edges = (
                 await self._edge_table.query()
                 .select(["source_node_id", "target_node_id"])
@@ -1412,6 +1466,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
             return []
 
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
+        """按 _id 的 LIKE 模糊匹配搜索节点，结果按 精确>前缀>包含 排序。"""
         query_strip = query.strip()
         if not query_strip:
             return []
@@ -1437,7 +1492,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
 
             labels = [r["_id"] for r in results]
 
-            # Sort: exact match first, then starts-with, then contains
+            # 排序：精确匹配 > 前缀匹配 > 包含匹配
             def sort_key(label):
                 label_lower = label.lower()
                 query_lower = query_strip.lower()
@@ -1486,7 +1541,7 @@ class LanceDBGraphStorage(BaseGraphStorage):
 
 
 # ---------------------------------------------------------------------------
-# DocStatus Schema
+# 文档状态 Schema：记录每个文档的索引进度、chunks、错误信息等
 # ---------------------------------------------------------------------------
 
 DOC_STATUS_SCHEMA = pa.schema(
@@ -1503,13 +1558,13 @@ DOC_STATUS_SCHEMA = pa.schema(
         pa.field("chunks_list", pa.utf8()),  # JSON-encoded list
         pa.field("error_msg", pa.utf8()),
         pa.field("metadata", pa.utf8()),  # JSON-encoded dict
-        pa.field("multimodal_processed", pa.utf8()),  # "true"/"false"/""
+        pa.field("multimodal_processed", pa.utf8()),  # "true"/"false"/""，用于多模态处理标记
     ]
 )
 
 
 # ---------------------------------------------------------------------------
-# LanceDBDocStatusStorage
+# LanceDBDocStatusStorage：文档索引状态，用于断点续传、重试、去重
 # ---------------------------------------------------------------------------
 
 
@@ -1567,7 +1622,7 @@ class LanceDBDocStatusStorage(DocStatusStorage):
             self._table = None
 
     def _prepare_doc_status_data(self, doc: dict[str, Any]) -> dict[str, Any]:
-        """Normalize a LanceDB row to DocProcessingStatus-compatible dict."""
+        """将 LanceDB 行转换为 DocProcessingStatus 可用的 dict，含 JSON 解析、类型转换。"""
         data = dict(doc)
         data.pop("_id", None)
         data.pop("_rowid", None)
@@ -1630,7 +1685,7 @@ class LanceDBDocStatusStorage(DocStatusStorage):
         return data
 
     def _doc_to_record(self, doc_id: str, v: dict[str, Any]) -> dict[str, Any]:
-        """Convert a doc status dict to a LanceDB record."""
+        """将 DocProcessingStatus 转为 LanceDB 写入记录，list/dict 需 JSON 序列化。"""
         chunks_list = v.get("chunks_list", [])
         if isinstance(chunks_list, list):
             chunks_list_str = json.dumps(chunks_list)
@@ -1862,7 +1917,8 @@ class LanceDBDocStatusStorage(DocStatusStorage):
         sort_field: str = "updated_at",
         sort_direction: str = "desc",
     ) -> tuple[list[tuple[str, DocProcessingStatus]], int]:
-        # Validate parameters
+        """分页获取文档状态，支持按 status 过滤、按字段排序。返回 (doc_list, total_count)。"""
+        # 参数校验与默认值
         if page < 1:
             page = 1
         if page_size < 10:
