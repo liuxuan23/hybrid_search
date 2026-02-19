@@ -17,6 +17,7 @@ STORAGE_IMPLEMENTATIONS = {
             "MongoGraphStorage",
             "MemgraphStorage",
             "LanceDBGraphStorage",
+            "OptimizedLanceDBGraphStorage",
         ],
         "required_methods": ["upsert_node", "upsert_edge"],
     },
@@ -100,6 +101,7 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
     "LanceDBVectorStorage": [],
     "LanceDBGraphStorage": [],
     "LanceDBDocStatusStorage": [],
+    "OptimizedLanceDBGraphStorage": [],
 }
 
 # Storage implementation module mapping
@@ -129,6 +131,7 @@ STORAGES = {
     "LanceDBVectorStorage": ".kg.lancedb_impl",
     "LanceDBGraphStorage": ".kg.lancedb_impl",
     "LanceDBDocStatusStorage": ".kg.lancedb_impl",
+    "OptimizedLanceDBGraphStorage": ".kg.lancedb_graph_optimizer",
 }
 
 

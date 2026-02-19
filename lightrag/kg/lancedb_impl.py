@@ -749,7 +749,6 @@ def _make_edge_id(src: str, tgt: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@final
 @dataclass
 class LanceDBGraphStorage(BaseGraphStorage):
     db: Any = field(default=None)

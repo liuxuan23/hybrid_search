@@ -70,6 +70,10 @@ download_models_hf.py
 # temporary test files in project root
 /test_*
 
+# local test DBs (avoid /tmp usage)
+/tests/_test_optimizer_db/
+/tests/_prebuilt_db/
+
 # Cline files
 memory-bank
 .claude/CLAUDE.md
