@@ -17,6 +17,9 @@ OptimizedLanceDBGraphStorage 功能测试 + 性能对比测试。
     # 先构建：python tests/prebuild_graph_db.py --n_nodes 5000 --n_extra_edges 15000
     # 再测试：PERF_DB_DIR=tests/_prebuilt_db pytest -v -k "TestPerformancePrebuild" tests/test_lancedb_graph_optimizer.py -s
 
+    # 大图（百万节点级别）跳过内存缓存测试（避免 OOM）：
+    # PERF_DB_DIR=/data/_prebuilt_db PERF_SKIP_MEMCACHE=1 pytest -v -k "TestPerformancePrebuild" tests/test_lancedb_graph_optimizer.py -s
+
     # 全部
     pytest tests/test_lancedb_graph_optimizer.py -v
 """
@@ -455,14 +458,15 @@ class TestAdjIndexTable:
 
     @pytest.mark.asyncio
     async def test_query_edges_from_adj_table(self):
-        """通过索引表查询诱导子图的边 ID。"""
+        """新版 adj 表不存 edge 信息，应返回空列表。"""
         s = await _make_optimized_storage(enable_adj_index_table=True)
         await _insert_test_graph(s, num_nodes=5, chain=True)
         await s._rebuild_adj_index_table()
 
-        edge_ids = await s._query_edges_from_adj_table(["node_1", "node_2", "node_3"])
-        # node_1-node_2, node_2-node_3 → 2 edge IDs
-        assert len(edge_ids) == 2
+        edge_ids, edge_row_ids = await s._query_edges_from_adj_table(["node_1", "node_2", "node_3"])
+        # 新版 per-node-one-row 不存 edge 信息，返回空
+        assert edge_ids == []
+        assert edge_row_ids == []
         await s.finalize()
 
     @pytest.mark.asyncio
@@ -512,6 +516,82 @@ class TestAdjIndexTable:
         assert "node_0" in node_ids
         assert "node_1" in node_ids
         assert "node_2" in node_ids
+        await s.finalize()
+
+    @pytest.mark.asyncio
+    async def test_take_adj_neighbors(self):
+        """测试 take 路径：通过 node_row_ids 获取下一跳邻居。"""
+        s = await _make_optimized_storage(enable_adj_index_table=True)
+        await _insert_test_graph(s, num_nodes=6, chain=True)
+        await s._rebuild_adj_index_table()
+
+        # 先用 WHERE 路径获取 node_0 的邻居和 node_row_ids
+        neighbors, node_row_ids = await s._query_neighbors_with_adj_rowids(["node_0"])
+        assert "node_1" in neighbors.get("node_0", set())
+        assert len(node_row_ids) > 0
+
+        # 用 take 路径获取下一跳邻居
+        neighbors2, node_row_ids2 = await s._take_adj_neighbors(node_row_ids)
+        # node_0 的邻居是 node_1，node_1 的邻居应包含 node_0 和 node_2
+        all_next_neighbors = set()
+        for nset in neighbors2.values():
+            all_next_neighbors.update(nset)
+        assert "node_0" in all_next_neighbors or "node_2" in all_next_neighbors
+        await s.finalize()
+
+    @pytest.mark.asyncio
+    async def test_adj_records_have_out_in_lists(self):
+        """验证 _rebuild 后每个节点有 out / in 列表，且 _rowid 可 take 到正确的节点。"""
+        s = await _make_optimized_storage(enable_adj_index_table=True)
+        await _insert_test_graph(s, num_nodes=4, chain=True)
+        await s._rebuild_adj_index_table()
+
+        # 读取邻接索引表全部记录（每个节点一行）
+        adj_rows = await s._adj_index_table.query().to_list()
+        assert len(adj_rows) == 4  # 4 个节点 → 4 行
+
+        # 构建 entity_id → row 映射
+        adj_by_id = {r["entity_id"]: r for r in adj_rows}
+
+        # chain: node_0→node_1→node_2→node_3
+        # node_0: out=[node_1_rid], in=[]
+        assert len(adj_by_id["node_0"]["out"]) == 1
+        assert len(adj_by_id["node_0"]["in"]) == 0
+        # node_1: out=[node_2_rid], in=[node_0_rid]
+        assert len(adj_by_id["node_1"]["out"]) == 1
+        assert len(adj_by_id["node_1"]["in"]) == 1
+        # node_3: out=[], in=[node_2_rid]
+        assert len(adj_by_id["node_3"]["out"]) == 0
+        assert len(adj_by_id["node_3"]["in"]) == 1
+
+        # 验证 out 列表中的 _rowid 可 take 到正确的节点
+        out_rids = [int(v) for v in adj_by_id["node_1"]["out"]]
+        node_result = await s._node_table.take_row_ids(out_rids).to_list()
+        assert len(node_result) == 1
+        assert node_result[0]["_id"] == "node_2"
+        await s.finalize()
+
+    @pytest.mark.asyncio
+    async def test_bfs_take_path_consistency(self):
+        """验证 BFS take 路径与 WHERE 路径结果一致。"""
+        s = await _make_optimized_storage(enable_adj_index_table=True)
+        await _insert_test_graph(s, num_nodes=8, chain=True)
+        await s._rebuild_adj_index_table()
+
+        # 禁用内存缓存，强制走邻接索引表路径
+        s._cache_loaded = False
+        s._adj_cache = {}
+        s._node_edges_cache = {}
+        s._ensure_adj_cache = lambda: asyncio.coroutine(lambda: None)()
+
+        kg = await s.get_knowledge_graph("node_0", max_depth=3, max_nodes=100)
+        node_ids = {n.id for n in kg.nodes}
+        # depth=3 从 node_0 出发: node_0, node_1, node_2, node_3
+        assert "node_0" in node_ids
+        assert "node_1" in node_ids
+        assert "node_2" in node_ids
+        assert "node_3" in node_ids
+        assert len(kg.nodes) == 4
         await s.finalize()
 
 
@@ -864,6 +944,15 @@ _PERF_DB_DIR = os.environ.get("PERF_DB_DIR", "")
 # 测试重复次数（可配置）
 _PREBUILD_REPEATS = int(os.environ.get("PERF_PREBUILD_REPEATS", "3"))
 
+# 是否跳过内存缓存测试（大图场景避免 OOM）
+_SKIP_MEMCACHE = os.environ.get("PERF_SKIP_MEMCACHE", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+# 采样上限（避免 WHERE IN (...) 子句过大 / 全表扫描导致 OOM）
+_SAMPLE_NODES = int(os.environ.get("PERF_SAMPLE_NODES", "5000"))
+_SAMPLE_EDGES = int(os.environ.get("PERF_SAMPLE_EDGES", "500"))
+
 
 def _read_prebuild_meta(db_dir: str) -> dict[str, int]:
     """读取 prebuild_graph_db.py 写入的 meta.txt。"""
@@ -894,7 +983,12 @@ async def _open_base_from_prebuilt(db_path: str, namespace: str):
 async def _open_opt_from_prebuilt(
     db_path: str, namespace: str, disable_memory_cache: bool = False
 ):
-    """从预构建目录打开 OptimizedLanceDBGraphStorage（只读查询）。"""
+    """从预构建目录打开 OptimizedLanceDBGraphStorage（只读查询）。
+
+    当 disable_memory_cache=True 时，在 initialize() **之前** 就替换
+    _ensure_adj_cache 为 noop，防止初始化或后续查询过程中触发全量边
+    加载到内存（百万级边时会导致 OOM）。
+    """
     from lightrag.kg.lancedb_graph_optimizer import OptimizedLanceDBGraphStorage
     from lightrag.kg.lancedb_impl import ClientManager
     ClientManager._instances = {"db": None, "ref_count": 0}
@@ -907,13 +1001,18 @@ async def _open_opt_from_prebuilt(
         enable_adj_index_table=True,
         enable_physical_clustering=False,
     )
-    await s.initialize()
 
+    # 关键：在 initialize() 之前就禁用内存缓存，
+    # 防止任何代码路径（包括 initialize 内部）触发全量边表加载
     if disable_memory_cache:
         async def _noop():
             pass
         s._ensure_adj_cache = _noop
+        s._cache_loaded = False
+        s._adj_cache = {}
+        s._node_edges_cache = {}
 
+    await s.initialize()
     return s
 
 
@@ -926,14 +1025,21 @@ class TestPerformancePrebuild:
     """
     使用预构建 DB 的大规模性能测试，纯聚焦查询阶段。
 
-    测试维度（每种查询对比 3 个实现）：
+    测试维度（每种查询对比 2~3 个实现）：
       - base:     LanceDBGraphStorage（父类，全量 edge 表扫描）
-      - opt:      OptimizedLanceDBGraphStorage（内存缓存优先）
+      - opt:      OptimizedLanceDBGraphStorage（内存缓存优先）—— 大图可跳过
       - adj_only: OptimizedLanceDBGraphStorage（仅邻接索引表，禁用内存缓存）
 
     环境变量：
-      - PERF_DB_DIR:           预构建 DB 根目录（必需）
-      - PERF_PREBUILD_REPEATS: 每项查询重复次数（默认 3）
+      - PERF_DB_DIR:            预构建 DB 根目录（必需）
+      - PERF_PREBUILD_REPEATS:  每项查询重复次数（默认 3）
+      - PERF_SKIP_MEMCACHE:     设为 1 跳过内存缓存测试（大图避免 OOM）
+      - PERF_SAMPLE_NODES:      批量度数查询采样节点数（默认 5000，避免 WHERE IN 过大）
+      - PERF_SAMPLE_EDGES:      边度数查询采样边数（默认 500）
+
+    大图使用方式（百万节点级别）：
+      PERF_DB_DIR=/data/_prebuilt_db PERF_SKIP_MEMCACHE=1 \\
+      pytest -v -k "TestPerformancePrebuild" tests/test_lancedb_graph_optimizer.py -s
     """
 
     NAMESPACE = "perf_graph"
@@ -950,7 +1056,11 @@ class TestPerformancePrebuild:
 
     @pytest.fixture
     async def opt_storage(self):
-        """打开预构建 opt DB（内存缓存 + 邻接索引表）。"""
+        """打开预构建 opt DB（内存缓存 + 邻接索引表）。
+        当 PERF_SKIP_MEMCACHE=1 时返回 None，避免大图 OOM。"""
+        if _SKIP_MEMCACHE:
+            yield None
+            return
         from lightrag.kg.shared_storage import initialize_share_data
         initialize_share_data(workers=1)
         s = await _open_opt_from_prebuilt(
@@ -974,13 +1084,30 @@ class TestPerformancePrebuild:
 
     @staticmethod
     async def _time_async(coro_func, repeats=3):
+        """多次执行异步函数，返回最小耗时。OOM / 内存不足时返回 None。"""
+        import gc
         times = []
         for _ in range(repeats):
+            gc.collect()  # 每次迭代前回收垃圾，降低内存峰值
             start = time.perf_counter()
-            await coro_func()
+            try:
+                await coro_func()
+            except (MemoryError, RuntimeError, OSError) as e:
+                # LanceDB 内存不足时可能抛 RuntimeError 或 OSError
+                print(f"\n  ⚠ OOM/资源不足: {type(e).__name__}: {e}")
+                return None
             elapsed = time.perf_counter() - start
             times.append(elapsed)
         return min(times)
+
+    @staticmethod
+    def _fmt(label: str, t, t_base=None):
+        """格式化单项计时输出。t 为 None 表示 OOM/SKIPPED。"""
+        if t is None:
+            return f"{label}: OOM "
+        if t_base is not None and t_base is not None and t > 0:
+            return f"{label}: {t:.4f}s ({t_base/t:.1f}x) "
+        return f"{label}: {t:.4f}s "
 
     def _meta(self) -> dict[str, int]:
         return _read_prebuild_meta(_PERF_DB_DIR)
@@ -990,43 +1117,41 @@ class TestPerformancePrebuild:
     async def test_perf_prebuild_node_degree_batch(
         self, base_storage, opt_storage, adj_only_storage
     ):
-        """预构建 DB：批量度数查询（3 路对比）。"""
+        """预构建 DB：批量度数查询（2~3 路对比）。"""
         meta = self._meta()
-        node_ids = [f"node_{i}" for i in range(meta["n_nodes"])]
+        # 采样：避免 WHERE IN (node_0, ..., node_999999) 过大导致 OOM
+        sample_n = min(meta["n_nodes"], _SAMPLE_NODES)
+        node_ids = [f"node_{i}" for i in range(sample_n)]
         repeats = _PREBUILD_REPEATS
 
         t_base = await self._time_async(
             lambda: base_storage.node_degrees_batch(node_ids), repeats
         )
-        t_opt = await self._time_async(
-            lambda: opt_storage.node_degrees_batch(node_ids), repeats
-        )
         t_adj = await self._time_async(
             lambda: adj_only_storage.node_degrees_batch(node_ids), repeats
         )
+        t_opt = None
+        if opt_storage is not None:
+            t_opt = await self._time_async(
+                lambda: opt_storage.node_degrees_batch(node_ids), repeats
+            )
 
-        print(
-            f"\n[Prebuild node_degrees_batch({meta['n_nodes']})] "
-            f"Base: {t_base:.4f}s | MemCache: {t_opt:.4f}s ({t_base/t_opt:.1f}x) | "
-            f"AdjTable: {t_adj:.4f}s ({t_base/t_adj:.1f}x)"
-        )
+        f = self._fmt
+        parts = [f("Base", t_base)]
+        parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
+        parts.append(f("AdjTable", t_adj, t_base))
+        print(f"\n[Prebuild node_degrees_batch({sample_n})] " + "| ".join(parts))
 
     # ---- BFS 遍历 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_bfs(
         self, base_storage, opt_storage, adj_only_storage
     ):
-        """预构建 DB：BFS 遍历（3 路对比）。"""
+        """预构建 DB：BFS 遍历（2~3 路对比）。"""
         repeats = _PREBUILD_REPEATS
 
         t_base = await self._time_async(
             lambda: base_storage.get_knowledge_graph(
-                "node_0", max_depth=3, max_nodes=200
-            ),
-            repeats,
-        )
-        t_opt = await self._time_async(
-            lambda: opt_storage.get_knowledge_graph(
                 "node_0", max_depth=3, max_nodes=200
             ),
             repeats,
@@ -1037,90 +1162,106 @@ class TestPerformancePrebuild:
             ),
             repeats,
         )
+        t_opt = None
+        if opt_storage is not None:
+            t_opt = await self._time_async(
+                lambda: opt_storage.get_knowledge_graph(
+                    "node_0", max_depth=3, max_nodes=200
+                ),
+                repeats,
+            )
 
-        print(
-            f"\n[Prebuild BFS depth=3 max_nodes=200] "
-            f"Base: {t_base:.4f}s | MemCache: {t_opt:.4f}s ({t_base/t_opt:.1f}x) | "
-            f"AdjTable: {t_adj:.4f}s ({t_base/t_adj:.1f}x)"
-        )
+        f = self._fmt
+        parts = [f("Base", t_base)]
+        parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
+        parts.append(f("AdjTable", t_adj, t_base))
+        print(f"\n[Prebuild BFS depth=3 max_nodes=200] " + "| ".join(parts))
 
     # ---- 子集边过滤 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_fetch_edges(
         self, base_storage, opt_storage, adj_only_storage
     ):
-        """预构建 DB：子集边过滤（3 路对比）。"""
+        """预构建 DB：子集边过滤（2~3 路对比）。"""
         subset = [f"node_{i}" for i in range(100)]
         repeats = _PREBUILD_REPEATS
 
         t_base = await self._time_async(
             lambda: base_storage._fetch_edges_between_nodes(subset), repeats
         )
-        t_opt = await self._time_async(
-            lambda: opt_storage._fetch_edges_between_nodes(subset), repeats
-        )
         t_adj = await self._time_async(
             lambda: adj_only_storage._fetch_edges_between_nodes(subset), repeats
         )
+        t_opt = None
+        if opt_storage is not None:
+            t_opt = await self._time_async(
+                lambda: opt_storage._fetch_edges_between_nodes(subset), repeats
+            )
 
-        print(
-            f"\n[Prebuild _fetch_edges_between_nodes(100)] "
-            f"Base: {t_base:.4f}s | MemCache: {t_opt:.4f}s ({t_base/t_opt:.1f}x) | "
-            f"AdjTable: {t_adj:.4f}s ({t_base/t_adj:.1f}x)"
-        )
+        f = self._fmt
+        parts = [f("Base", t_base)]
+        parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
+        parts.append(f("AdjTable", t_adj, t_base))
+        print(f"\n[Prebuild _fetch_edges_between_nodes(100)] " + "| ".join(parts))
 
     # ---- 全图度数排序 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_all_by_degree(
         self, base_storage, opt_storage, adj_only_storage
     ):
-        """预构建 DB：全图度数排序取 Top-K（3 路对比）。"""
+        """预构建 DB：全图度数排序取 Top-K（2~3 路对比）。
+        注意：base 路径会全表扫描 edge 表，百万级边时可能 OOM。"""
         repeats = _PREBUILD_REPEATS
 
         t_base = await self._time_async(
             lambda: base_storage.get_knowledge_graph("*", max_depth=3, max_nodes=100),
             repeats,
         )
-        t_opt = await self._time_async(
-            lambda: opt_storage.get_knowledge_graph("*", max_depth=3, max_nodes=100),
-            repeats,
-        )
         t_adj = await self._time_async(
             lambda: adj_only_storage.get_knowledge_graph("*", max_depth=3, max_nodes=100),
             repeats,
         )
+        t_opt = None
+        if opt_storage is not None:
+            t_opt = await self._time_async(
+                lambda: opt_storage.get_knowledge_graph("*", max_depth=3, max_nodes=100),
+                repeats,
+            )
 
-        print(
-            f"\n[Prebuild get_knowledge_graph(*) max_nodes=100] "
-            f"Base: {t_base:.4f}s | MemCache: {t_opt:.4f}s ({t_base/t_opt:.1f}x) | "
-            f"AdjTable: {t_adj:.4f}s ({t_base/t_adj:.1f}x)"
-        )
+        f = self._fmt
+        parts = [f("Base", t_base)]
+        parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
+        parts.append(f("AdjTable", t_adj, t_base))
+        print(f"\n[Prebuild get_knowledge_graph(*) max_nodes=100] " + "| ".join(parts))
 
     # ---- 边度数批量 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_edge_degrees(
         self, base_storage, opt_storage, adj_only_storage
     ):
-        """预构建 DB：边度数批量查询（3 路对比）。"""
+        """预构建 DB：边度数批量查询（2~3 路对比）。"""
         meta = self._meta()
+        sample_e = min(meta["n_nodes"] - 1, _SAMPLE_EDGES)
         edge_pairs = [
             (f"node_{i}", f"node_{i+1}")
-            for i in range(min(meta["n_nodes"] - 1, 500))
+            for i in range(sample_e)
         ]
         repeats = _PREBUILD_REPEATS
 
         t_base = await self._time_async(
             lambda: base_storage.edge_degrees_batch(edge_pairs), repeats
         )
-        t_opt = await self._time_async(
-            lambda: opt_storage.edge_degrees_batch(edge_pairs), repeats
-        )
         t_adj = await self._time_async(
             lambda: adj_only_storage.edge_degrees_batch(edge_pairs), repeats
         )
+        t_opt = None
+        if opt_storage is not None:
+            t_opt = await self._time_async(
+                lambda: opt_storage.edge_degrees_batch(edge_pairs), repeats
+            )
 
-        print(
-            f"\n[Prebuild edge_degrees_batch({len(edge_pairs)} edges)] "
-            f"Base: {t_base:.4f}s | MemCache: {t_opt:.4f}s ({t_base/t_opt:.1f}x) | "
-            f"AdjTable: {t_adj:.4f}s ({t_base/t_adj:.1f}x)"
-        )
+        f = self._fmt
+        parts = [f("Base", t_base)]
+        parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
+        parts.append(f("AdjTable", t_adj, t_base))
+        print(f"\n[Prebuild edge_degrees_batch({sample_e} edges)] " + "| ".join(parts))

@@ -123,34 +123,45 @@ def _generate_graph_data(
 
 
 def _generate_adj_index_records(
-    node_records: list[dict],
     edge_records: list[dict],
+    node_id_to_rowid: dict[str, int],
 ) -> list[dict]:
     """
-    根据已生成的 node/edge records 在内存中直接构造邻接索引表 records，
-    避免写入 edge 表后再 _rebuild_adj_index_table() 全表扫描一次。
+    根据已写入的 node/edge records 构造邻接索引表 records（per-node-one-row 方案）。
+
+    参数：
+      - edge_records: 边记录列表（与写入顺序一致）
+      - node_id_to_rowid: node _id → 真实 Lance _rowid（从 node 表读回）
+
+    每个节点一行：
+      entity_id: 节点 ID
+      out: 出邻居在 node 表中的 _rowid 列表（src→tgt）
+      in:  入邻居在 node 表中的 _rowid 列表（tgt←src）
     """
-    from lightrag.kg.lancedb_impl import _make_edge_id
+    from collections import defaultdict
 
-    node_id_to_row = {r["_id"]: i for i, r in enumerate(node_records)}
+    out_map: dict[str, set[int]] = defaultdict(set)
+    in_map: dict[str, set[int]] = defaultdict(set)
 
-    adj_records: list[dict] = []
-    for ei, e in enumerate(edge_records):
+    for e in edge_records:
         src = e["source_node_id"]
         tgt = e["target_node_id"]
-        eid = e["_id"]
-        w = float(e.get("weight") or 0.0)
-        ns = node_id_to_row.get(src, -1)
-        nt = node_id_to_row.get(tgt, -1)
-        adj_records.append({
-            "entity_id": src, "next_hop_id": tgt, "edge_id": eid,
-            "edge_row_id": ei, "node_row_id": ns, "weight": w,
+        tgt_rid = node_id_to_rowid.get(tgt)
+        src_rid = node_id_to_rowid.get(src)
+        if tgt_rid is not None:
+            out_map[src].add(tgt_rid)
+        if src_rid is not None:
+            in_map[tgt].add(src_rid)
+
+    records: list[dict] = []
+    for nid in node_id_to_rowid:
+        records.append({
+            "entity_id": nid,
+            "out": sorted(out_map.get(nid, set())),
+            "in": sorted(in_map.get(nid, set())),
         })
-        adj_records.append({
-            "entity_id": tgt, "next_hop_id": src, "edge_id": eid,
-            "edge_row_id": ei, "node_row_id": nt, "weight": w,
-        })
-    return adj_records
+
+    return records
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +191,6 @@ async def _build_one_db(
     namespace: str,
     node_records: list[dict],
     edge_records: list[dict],
-    adj_records: list[dict] | None = None,
     is_optimized: bool = False,
     enable_adj_index: bool = False,
     batch_size: int = 10000,
@@ -190,6 +200,9 @@ async def _build_one_db(
 
     直接使用 table.add() 批量追加预先在内存中生成好的 records，
     而不是逐条 upsert_node/upsert_edge。
+
+    对于 optimized 路径：写入 node/edge 后读回真实 _rowid，
+    再生成邻接索引表记录（确保 edge_row_id/node_row_id 为真实 Lance _rowid）。
     """
     from lightrag.kg.lancedb_impl import ClientManager, GRAPH_NODE_SCHEMA, GRAPH_EDGE_SCHEMA
 
@@ -230,9 +243,30 @@ async def _build_one_db(
     await _bulk_write_table(s._edge_table, edge_records, GRAPH_EDGE_SCHEMA, batch_size)
     print(f"    Edges done in {time.perf_counter() - t:.1f}s")
 
-    # 邻接索引表：直接从内存 adj_records 写入，不走 _rebuild（避免再全表扫描一次）
-    if is_optimized and enable_adj_index and adj_records:
+    # 邻接索引表：读回 node _rowid，生成 per-node-one-row 记录
+    if is_optimized and enable_adj_index:
         from lightrag.kg.lancedb_graph_optimizer import KG_ADJ_INDEX_SCHEMA
+
+        # 读回 node 表的真实 _rowid
+        print(f"    Reading back node _rowids ...")
+        t = time.perf_counter()
+        node_rows = (
+            await s._node_table.query()
+            .with_row_id()
+            .select(["_id"])
+            .to_list()
+        )
+        node_id_to_rowid = {r["_id"]: int(r["_rowid"]) for r in node_rows}
+        print(f"    Node _rowids read in {time.perf_counter() - t:.1f}s ({len(node_id_to_rowid)} nodes)")
+
+        # 生成邻接索引记录（per-node-one-row: entity_id, out, in）
+        print(f"    Generating adj index records ...")
+        t = time.perf_counter()
+        adj_records = _generate_adj_index_records(
+            edge_records, node_id_to_rowid
+        )
+        print(f"    Generated {len(adj_records)} adj records in {time.perf_counter() - t:.1f}s")
+
         adj_name = f"{s._node_table_name}_adj_idx"
         print(f"    Writing {len(adj_records)} adj index rows → {adj_name} ...")
         t = time.perf_counter()
@@ -292,24 +326,18 @@ async def main(n_nodes: int, n_extra_edges: int, db_dir: str, batch_size: int, s
     total_edges = n_nodes - 1 + n_extra_edges
 
     # ---- 0) 在内存中一次性生成全部 records ----
-    print(f"\n[0/3] Generating graph data in memory: {n_nodes} nodes, {total_edges} edges ...")
+    print(f"\n[0/2] Generating graph data in memory: {n_nodes} nodes, {total_edges} edges ...")
     t0 = time.perf_counter()
     node_records, edge_records = _generate_graph_data(n_nodes, n_extra_edges, seed=seed)
     print(f"  Generated {len(node_records)} node records + {len(edge_records)} edge records "
           f"in {time.perf_counter() - t0:.1f}s")
-
-    # ---- 0.5) 在内存中生成邻接索引表 records（仅 opt 需要）----
-    print(f"\n[1/3] Generating adjacency index records in memory ...")
-    t0 = time.perf_counter()
-    adj_records = _generate_adj_index_records(node_records, edge_records)
-    print(f"  Generated {len(adj_records)} adj index records in {time.perf_counter() - t0:.1f}s")
 
     # ---- 1) Base storage ----
     base_path = os.path.join(db_dir, "base")
     if os.path.exists(base_path):
         shutil.rmtree(base_path)
     os.makedirs(base_path)
-    print(f"\n[2/3] Building BASE storage → {base_path}")
+    print(f"\n[1/2] Building BASE storage → {base_path}")
     t0 = time.perf_counter()
     await _build_one_db(
         base_path, namespace, node_records, edge_records,
@@ -319,15 +347,15 @@ async def main(n_nodes: int, n_extra_edges: int, db_dir: str, batch_size: int, s
     print(f"  Total: {time.perf_counter() - t0:.1f}s")
 
     # ---- 2) Optimized storage（内存缓存 + 邻接索引表）----
+    # 邻接索引表在 _build_one_db 内部生成（需先写入 node/edge 后读回真实 _rowid）
     opt_path = os.path.join(db_dir, "opt")
     if os.path.exists(opt_path):
         shutil.rmtree(opt_path)
     os.makedirs(opt_path)
-    print(f"\n[3/3] Building OPTIMIZED storage (adj index) → {opt_path}")
+    print(f"\n[2/2] Building OPTIMIZED storage (adj index) → {opt_path}")
     t0 = time.perf_counter()
     await _build_one_db(
         opt_path, namespace, node_records, edge_records,
-        adj_records=adj_records,
         is_optimized=True,
         enable_adj_index=True,
         batch_size=batch_size,
