@@ -503,12 +503,15 @@ class TestAdjIndexTable:
         await _insert_test_graph(s, num_nodes=6, chain=True)
         await s._rebuild_adj_index_table()
 
-        # 强制禁用内存缓存
+        # 强制禁用内存缓存，阻止后续查询中重建邻接缓存
         s._cache_loaded = False
         s._adj_cache = {}
         s._node_edges_cache = {}
-        # 猴子补丁阻止缓存重建
-        s._ensure_adj_cache = lambda: asyncio.coroutine(lambda: None)()
+
+        async def _noop_cache():
+            return None
+
+        s._ensure_adj_cache = _noop_cache
 
         kg = await s.get_knowledge_graph("node_0", max_depth=2, max_nodes=100)
         assert len(kg.nodes) == 3  # depth=2: node_0, node_1, node_2
@@ -582,7 +585,11 @@ class TestAdjIndexTable:
         s._cache_loaded = False
         s._adj_cache = {}
         s._node_edges_cache = {}
-        s._ensure_adj_cache = lambda: asyncio.coroutine(lambda: None)()
+
+        async def _noop_cache():
+            return None
+
+        s._ensure_adj_cache = _noop_cache
 
         kg = await s.get_knowledge_graph("node_0", max_depth=3, max_nodes=100)
         node_ids = {n.id for n in kg.nodes}
@@ -981,7 +988,11 @@ async def _open_base_from_prebuilt(db_path: str, namespace: str):
 
 
 async def _open_opt_from_prebuilt(
-    db_path: str, namespace: str, disable_memory_cache: bool = False
+    db_path: str,
+    namespace: str,
+    disable_memory_cache: bool = False,
+    *,
+    enable_physical_clustering: bool = False,
 ):
     """从预构建目录打开 OptimizedLanceDBGraphStorage（只读查询）。
 
@@ -999,7 +1010,7 @@ async def _open_opt_from_prebuilt(
         embedding_func=None,
         workspace="",
         enable_adj_index_table=True,
-        enable_physical_clustering=False,
+        enable_physical_clustering=enable_physical_clustering,
     )
 
     # 关键：在 initialize() 之前就禁用内存缓存，
@@ -1076,9 +1087,39 @@ class TestPerformancePrebuild:
         from lightrag.kg.shared_storage import initialize_share_data
         initialize_share_data(workers=1)
         s = await _open_opt_from_prebuilt(
-            os.path.join(_PERF_DB_DIR, "opt"), self.NAMESPACE,
+            os.path.join(_PERF_DB_DIR, "opt"),
+            self.NAMESPACE,
             disable_memory_cache=True,
+            enable_physical_clustering=False,
         )
+        yield s
+        await s.finalize()
+
+    @pytest.fixture
+    async def clustered_adj_storage(self):
+        """打开预构建 opt DB，禁用内存缓存 + 启用物理聚簇。
+
+        默认实例使用未聚簇邻接索引表；此处在 index_done_callback 之后
+        将 _adj_index_table 指向聚簇版本 ({node_table_name}_adj_idx_clustered)，
+        便于与未聚簇版本进行对比测试。
+        """
+        from lightrag.kg.shared_storage import initialize_share_data
+
+        initialize_share_data(workers=1)
+        s = await _open_opt_from_prebuilt(
+            os.path.join(_PERF_DB_DIR, "opt"),
+            self.NAMESPACE,
+            disable_memory_cache=True,
+            enable_physical_clustering=True,
+        )
+        # 确保基于当前节点/边表重建邻接索引表（含聚簇版本）
+        await s.index_done_callback()
+        # 将邻接索引表句柄切换到聚簇版本
+        adj_cluster_name = f"{s._node_table_name}_adj_idx_clustered"
+        try:
+            s._adj_index_table = await s.db.open_table(adj_cluster_name)
+        except Exception as e:
+            print(f"\n  ⚠ Failed to open clustered adj index table: {e}")
         yield s
         await s.finalize()
 
@@ -1115,7 +1156,7 @@ class TestPerformancePrebuild:
     # ---- 批量度数 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_node_degree_batch(
-        self, base_storage, opt_storage, adj_only_storage
+        self, base_storage, opt_storage, adj_only_storage, clustered_adj_storage
     ):
         """预构建 DB：批量度数查询（2~3 路对比）。"""
         meta = self._meta()
@@ -1130,6 +1171,9 @@ class TestPerformancePrebuild:
         t_adj = await self._time_async(
             lambda: adj_only_storage.node_degrees_batch(node_ids), repeats
         )
+        t_adj_cluster = await self._time_async(
+            lambda: clustered_adj_storage.node_degrees_batch(node_ids), repeats
+        )
         t_opt = None
         if opt_storage is not None:
             t_opt = await self._time_async(
@@ -1140,12 +1184,13 @@ class TestPerformancePrebuild:
         parts = [f("Base", t_base)]
         parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
         parts.append(f("AdjTable", t_adj, t_base))
+        parts.append(f("AdjTable+Cluster", t_adj_cluster, t_base))
         print(f"\n[Prebuild node_degrees_batch({sample_n})] " + "| ".join(parts))
 
     # ---- BFS 遍历 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_bfs(
-        self, base_storage, opt_storage, adj_only_storage
+        self, base_storage, opt_storage, adj_only_storage, clustered_adj_storage
     ):
         """预构建 DB：BFS 遍历（2~3 路对比）。"""
         repeats = _PREBUILD_REPEATS
@@ -1158,6 +1203,12 @@ class TestPerformancePrebuild:
         )
         t_adj = await self._time_async(
             lambda: adj_only_storage.get_knowledge_graph(
+                "node_0", max_depth=3, max_nodes=200
+            ),
+            repeats,
+        )
+        t_adj_cluster = await self._time_async(
+            lambda: clustered_adj_storage.get_knowledge_graph(
                 "node_0", max_depth=3, max_nodes=200
             ),
             repeats,
@@ -1175,12 +1226,13 @@ class TestPerformancePrebuild:
         parts = [f("Base", t_base)]
         parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
         parts.append(f("AdjTable", t_adj, t_base))
+        parts.append(f("AdjTable+Cluster", t_adj_cluster, t_base))
         print(f"\n[Prebuild BFS depth=3 max_nodes=200] " + "| ".join(parts))
 
     # ---- 子集边过滤 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_fetch_edges(
-        self, base_storage, opt_storage, adj_only_storage
+        self, base_storage, opt_storage, adj_only_storage, clustered_adj_storage
     ):
         """预构建 DB：子集边过滤（2~3 路对比）。"""
         subset = [f"node_{i}" for i in range(100)]
@@ -1192,6 +1244,9 @@ class TestPerformancePrebuild:
         t_adj = await self._time_async(
             lambda: adj_only_storage._fetch_edges_between_nodes(subset), repeats
         )
+        t_adj_cluster = await self._time_async(
+            lambda: clustered_adj_storage._fetch_edges_between_nodes(subset), repeats
+        )
         t_opt = None
         if opt_storage is not None:
             t_opt = await self._time_async(
@@ -1202,12 +1257,13 @@ class TestPerformancePrebuild:
         parts = [f("Base", t_base)]
         parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
         parts.append(f("AdjTable", t_adj, t_base))
+        parts.append(f("AdjTable+Cluster", t_adj_cluster, t_base))
         print(f"\n[Prebuild _fetch_edges_between_nodes(100)] " + "| ".join(parts))
 
     # ---- 全图度数排序 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_all_by_degree(
-        self, base_storage, opt_storage, adj_only_storage
+        self, base_storage, opt_storage, adj_only_storage, clustered_adj_storage
     ):
         """预构建 DB：全图度数排序取 Top-K（2~3 路对比）。
         注意：base 路径会全表扫描 edge 表，百万级边时可能 OOM。"""
@@ -1218,7 +1274,15 @@ class TestPerformancePrebuild:
             repeats,
         )
         t_adj = await self._time_async(
-            lambda: adj_only_storage.get_knowledge_graph("*", max_depth=3, max_nodes=100),
+            lambda: adj_only_storage.get_knowledge_graph(
+                "*", max_depth=3, max_nodes=100
+            ),
+            repeats,
+        )
+        t_adj_cluster = await self._time_async(
+            lambda: clustered_adj_storage.get_knowledge_graph(
+                "*", max_depth=3, max_nodes=100
+            ),
             repeats,
         )
         t_opt = None
@@ -1232,12 +1296,13 @@ class TestPerformancePrebuild:
         parts = [f("Base", t_base)]
         parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
         parts.append(f("AdjTable", t_adj, t_base))
+        parts.append(f("AdjTable+Cluster", t_adj_cluster, t_base))
         print(f"\n[Prebuild get_knowledge_graph(*) max_nodes=100] " + "| ".join(parts))
 
     # ---- 边度数批量 ----
     @pytest.mark.asyncio
     async def test_perf_prebuild_edge_degrees(
-        self, base_storage, opt_storage, adj_only_storage
+        self, base_storage, opt_storage, adj_only_storage, clustered_adj_storage
     ):
         """预构建 DB：边度数批量查询（2~3 路对比）。"""
         meta = self._meta()
@@ -1254,6 +1319,9 @@ class TestPerformancePrebuild:
         t_adj = await self._time_async(
             lambda: adj_only_storage.edge_degrees_batch(edge_pairs), repeats
         )
+        t_adj_cluster = await self._time_async(
+            lambda: clustered_adj_storage.edge_degrees_batch(edge_pairs), repeats
+        )
         t_opt = None
         if opt_storage is not None:
             t_opt = await self._time_async(
@@ -1264,4 +1332,5 @@ class TestPerformancePrebuild:
         parts = [f("Base", t_base)]
         parts.append(f("MemCache", t_opt, t_base) if opt_storage is not None else "MemCache: SKIPPED ")
         parts.append(f("AdjTable", t_adj, t_base))
+        parts.append(f("AdjTable+Cluster", t_adj_cluster, t_base))
         print(f"\n[Prebuild edge_degrees_batch({sample_e} edges)] " + "| ".join(parts))

@@ -19,6 +19,16 @@
     # 大规模压测
     python tests/prebuild_graph_db.py --n_nodes 20000 --n_extra_edges 60000
 
+    # 创建目录并修改所有者
+    # 1. 创建目录
+    sudo mkdir -p /data/_prebuild_db_small
+
+    # 2. 把目录所有者改成你当前的用户
+    sudo chown -R ${USER}:${USER} /data/_prebuild_db_small
+
+    # 3. 运行脚本
+    python tests/prebuild_graph_db.py --n_nodes 100000 --n_extra_edges 1000000 --db_dir /data/_prebuild_db_small
+
 在测试中使用预构建数据：
     PERF_DB_DIR=tests/_prebuilt_db pytest -v -k "TestPerformancePrebuild" tests/test_lancedb_graph_optimizer.py -s
 """
@@ -51,8 +61,8 @@ def _generate_graph_data(
     seed: int = 42,
 ) -> tuple[list[dict], list[dict]]:
     """
-    在内存中生成链式图 + 随机边，返回 (node_records, edge_records)。
-    与测试中 _build_large_graph 逻辑对齐（同 seed 产生完全相同的边）。
+    在内存中生成「多聚簇 + 少量跨簇边」的图，返回 (node_records, edge_records)。
+    与测试中 _build_large_graph 逻辑对齐（同 seed 产生相同的边分布）。
 
     返回值直接可喂给 pa.Table.from_pylist()。
     """
@@ -79,17 +89,58 @@ def _generate_graph_data(
     rng = random.Random(seed)
     # 无向去重集：保存 (min_i, max_i)
     existing: set[tuple[int, int]] = set()
-    for i in range(n_nodes - 1):
-        existing.add((i, i + 1))
 
     # 先收集所有 (a, b, relationship)
     all_pairs: list[tuple[int, int, str]] = []
-    # 链式边
-    for i in range(n_nodes - 1):
-        all_pairs.append((i, i + 1, "next"))
-    # 随机边
+
+    # 1) 将节点划分为若干个社区（cluster），每个社区内部形成一条短链 + 若干额外边
+    #    这样既有明显的社区结构，又不会出现 0→...→N-1 的超级长链。
+    if n_nodes <= 1000:
+        n_clusters = max(1, n_nodes // 100)
+    else:
+        n_clusters = max(1, n_nodes // 10000)
+
+    base_cluster_size = n_nodes // n_clusters
+    remainder = n_nodes % n_clusters
+
+    start = 0
+    for cid in range(n_clusters):
+        size = base_cluster_size + (1 if cid < remainder else 0)
+        if size <= 1:
+            # 单节点社区，不需要内部边
+            start += size
+            continue
+        end = start + size  # [start, end)
+
+        # 社区内部链式边：start → ... → end-1
+        for i in range(start, end - 1):
+            lo, hi = i, i + 1
+            existing.add((lo, hi))
+            all_pairs.append((i, i + 1, "next"))
+
+        # 社区内部额外随机边，数量与社区大小成比例
+        # 控制为 O(size) 级别，避免生成过多冗余边
+        extra_intra = max(0, min(n_extra_edges, size * 2))
+        added = 0
+        while added < extra_intra:
+            a = rng.randint(start, end - 1)
+            b = rng.randint(start, end - 1)
+            if a == b:
+                continue
+            lo, hi = (a, b) if a < b else (b, a)
+            if (lo, hi) in existing:
+                continue
+            existing.add((lo, hi))
+            all_pairs.append((a, b, "random_intra"))
+            added += 1
+
+        start = end
+
+    # 2) 少量跨社区随机边，模拟社区之间的弱连接
+    #    跨社区边总数以 n_extra_edges 为上限，多余的 intra 已经用掉一部分。
+    remaining_extra = max(0, n_extra_edges - len([1 for _, _, rel in all_pairs if rel.startswith("random")]))
     count = 0
-    while count < n_extra_edges:
+    while count < remaining_extra:
         a = rng.randint(0, n_nodes - 1)
         b = rng.randint(0, n_nodes - 1)
         if a == b:
@@ -98,7 +149,7 @@ def _generate_graph_data(
         if (lo, hi) in existing:
             continue
         existing.add((lo, hi))
-        all_pairs.append((a, b, "random"))
+        all_pairs.append((a, b, "random_inter"))
         count += 1
 
     # 转成 edge records
@@ -268,10 +319,12 @@ async def _build_one_db(
         print(f"    Generated {len(adj_records)} adj records in {time.perf_counter() - t:.1f}s")
 
         adj_name = f"{s._node_table_name}_adj_idx"
-        print(f"    Writing {len(adj_records)} adj index rows → {adj_name} ...")
+        print(f"    Writing {len(adj_records)} adj index rows → {adj_name} (batch={batch_size}) ...")
         t = time.perf_counter()
-        adj_arrow = pa.Table.from_pylist(adj_records, schema=KG_ADJ_INDEX_SCHEMA)
-        s._adj_index_table = await s.db.create_table(adj_name, adj_arrow, mode="overwrite")
+        # 先创建空表，再按 batch_size 追加写入，避免一次性构建巨大 Arrow 表
+        empty_adj = pa.Table.from_pylist([], schema=KG_ADJ_INDEX_SCHEMA)
+        s._adj_index_table = await s.db.create_table(adj_name, empty_adj, mode="overwrite")
+        await _bulk_write_table(s._adj_index_table, adj_records, KG_ADJ_INDEX_SCHEMA, batch_size)
         # 创建 BTREE 标量索引
         if hasattr(s._adj_index_table, "create_scalar_index"):
             try:
@@ -361,6 +414,34 @@ async def main(n_nodes: int, n_extra_edges: int, db_dir: str, batch_size: int, s
         batch_size=batch_size,
     )
     print(f"  Total: {time.perf_counter() - t0:.1f}s")
+
+    # ---- 2.5) 基于已写入的 OPT DB 生成聚簇邻接索引表 ----
+    # 这里复用运行时的 index_done_callback 逻辑，在预构建阶段直接生成
+    # {namespace}_adj_idx（未聚簇）和 {namespace}_adj_idx_clustered（聚簇）两张表。
+    print(f"\n[2.5] Building clustered adj index on OPT storage → {opt_path}")
+    t0 = time.perf_counter()
+    from lightrag.kg.lancedb_graph_optimizer import OptimizedLanceDBGraphStorage
+    from lightrag.kg.lancedb_impl import ClientManager
+
+    ClientManager._instances = {"db": None, "ref_count": 0}
+    os.environ["LANCEDB_URI"] = opt_path
+    clustered_storage = OptimizedLanceDBGraphStorage(
+        namespace=namespace,
+        global_config={"max_graph_nodes": max(len(node_records) * 2, 10000)},
+        embedding_func=None,
+        workspace="",
+        enable_adj_index_table=True,
+        enable_physical_clustering=True,
+    )
+    await clustered_storage.initialize()
+    # index_done_callback 内部会调用 _run_physical_clustering（可选）和
+    # _rebuild_adj_index_table，从而生成基础 + 聚簇两个邻接索引表。
+    await clustered_storage.index_done_callback()
+    await clustered_storage.finalize()
+    ClientManager._instances = {"db": None, "ref_count": 0}
+    if "LANCEDB_URI" in os.environ:
+        del os.environ["LANCEDB_URI"]
+    print(f"  Clustered adj index built in {time.perf_counter() - t0:.1f}s")
 
     # ---- 写元数据 ----
     _write_meta(db_dir, n_nodes, n_extra_edges)

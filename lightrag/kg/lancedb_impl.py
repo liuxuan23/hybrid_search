@@ -80,13 +80,22 @@ async def get_or_create_table(
     db: lancedb.AsyncConnection, table_name: str, schema: pa.Schema
 ):
     """获取已存在的表，若不存在则按 schema 创建。用于各存储的 initialize 阶段。"""
-    table_names = await db.table_names()
-    if table_name in table_names:
+    # 优先尝试打开已存在的表；不存在时再创建。
+    # 直接使用 create_table + exist_ok 在某些版本的 LanceDB 上行为不一致，
+    # 因此这里采用 try/except 兜底，兼容 "table already exists" 场景。
+    try:
         return await db.open_table(table_name)
-    else:
-        tbl = await db.create_table(table_name, schema=schema)
-        logger.info(f"Created LanceDB table: {table_name}")
-        return tbl
+    except Exception:
+        try:
+            tbl = await db.create_table(table_name, schema=schema)
+            logger.info(f"Created LanceDB table: {table_name}")
+            return tbl
+        except ValueError as e:
+            # 表已经存在但 open_table 失败（可能由于命名空间差异等），
+            # 再次尝试打开，避免 "Table already exists" 导致初始化中断。
+            if "already exists" in str(e):
+                return await db.open_table(table_name)
+            raise
 
 
 def _compute_effective_workspace(workspace: str, env_var: str = "LANCEDB_WORKSPACE"):

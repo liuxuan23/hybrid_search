@@ -706,37 +706,96 @@ class OptimizedLanceDBGraphStorage(LanceDBGraphStorage):
             if src_rid is not None:
                 in_map[tgt].add(src_rid)
 
-        # 每个 node 一行
+        # 每个 node 一行（基础邻接索引表记录，未聚簇）
         records: list[dict] = []
         for nid in node_id_to_rowid:
-            records.append({
-                "entity_id": nid,
-                "out": sorted(out_map.get(nid, set())),
-                "in": sorted(in_map.get(nid, set())),
-            })
+            records.append(
+                {
+                    "entity_id": nid,
+                    "out": sorted(out_map.get(nid, set())),
+                    "in": sorted(in_map.get(nid, set())),
+                }
+            )
 
         if not records:
             return
 
-        # 一次性写入
-        tbl = pa.Table.from_pylist(records, schema=KG_ADJ_INDEX_SCHEMA)
-        adj_name = f"{self._node_table_name}_adj_idx"
+        # 1) 写入基础邻接索引表（未聚簇版本），供默认查询路径使用。
+        # 为避免一次性构建巨大 Arrow 表，这里先创建空表，再按固定 batch_size 追加写入。
+        base_name = f"{self._node_table_name}_adj_idx"
         try:
+            empty_tbl = pa.Table.from_pylist([], schema=KG_ADJ_INDEX_SCHEMA)
             self._adj_index_table = await self.db.create_table(
-                adj_name, tbl, mode="overwrite"
+                base_name, empty_tbl, mode="overwrite"
             )
+            batch_size = 10_000
+            for i in range(0, len(records), batch_size):
+                chunk = records[i : i + batch_size]
+                arrow_tbl = pa.Table.from_pylist(chunk, schema=KG_ADJ_INDEX_SCHEMA)
+                await self._adj_index_table.add(arrow_tbl)
         except Exception as e:
             logger.warning(f"[{self.workspace}] Rebuild adj index write failed: {e}")
             return
 
         # 为 entity_id 创建 BTREE 标量索引
-        if self._adj_index_table and hasattr(self._adj_index_table, "create_scalar_index"):
+        if self._adj_index_table and hasattr(
+            self._adj_index_table, "create_scalar_index"
+        ):
             try:
-                result = self._adj_index_table.create_scalar_index("entity_id", index_type="BTREE")
+                result = self._adj_index_table.create_scalar_index(
+                    "entity_id", index_type="BTREE"
+                )
                 if inspect.isawaitable(result):
                     await result
             except Exception:
                 pass
+
+        # 2) 可选：写入按社区聚簇后的邻接索引表，使用不同表名，便于性能对比测试
+        if self.enable_physical_clustering and edge_rows:
+            try:
+                edges_for_clustering = [
+                    (e["source_node_id"], e["target_node_id"]) for e in edge_rows
+                ]
+                community_labels = self._detect_communities(edges_for_clustering)
+
+                def _community_key(rec: dict) -> tuple[int, str]:
+                    nid = rec["entity_id"]
+                    # 未出现在任何边中的节点社区记为 -1，排在前面或单独成块
+                    return community_labels.get(nid, -1), nid
+
+                clustered_records = list(records)
+                clustered_records.sort(key=_community_key)
+
+                clustered_name = f"{self._node_table_name}_adj_idx_clustered"
+                empty_clustered = pa.Table.from_pylist(
+                    [], schema=KG_ADJ_INDEX_SCHEMA
+                )
+                clustered_table = await self.db.create_table(
+                    clustered_name, empty_clustered, mode="overwrite"
+                )
+                batch_size = 10_000
+                for i in range(0, len(clustered_records), batch_size):
+                    chunk = clustered_records[i : i + batch_size]
+                    arrow_tbl = pa.Table.from_pylist(
+                        chunk, schema=KG_ADJ_INDEX_SCHEMA
+                    )
+                    await clustered_table.add(arrow_tbl)
+
+                if clustered_table and hasattr(
+                    clustered_table, "create_scalar_index"
+                ):
+                    try:
+                        result = clustered_table.create_scalar_index(
+                            "entity_id", index_type="BTREE"
+                        )
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        pass
+            except Exception as e:
+                logger.warning(
+                    f"[{self.workspace}] Clustered adj index build skipped: {e}"
+                )
 
     # ---------- Section 4: 物理聚簇 ----------
     def _detect_communities(self, edges: list[tuple[str, str]]) -> dict[str, int]:
@@ -757,13 +816,24 @@ class OptimizedLanceDBGraphStorage(LanceDBGraphStorage):
                 return labels
             except Exception as e:
                 logger.debug(f"Louvain fallback: {e}")
-        # 默认：连通分量（纯 Python）
+        # 默认：连通分量（纯 Python，使用迭代版并查集，避免递归爆栈）
         parent: dict[str, str] = {}
 
         def find(x: str) -> str:
-            if parent.setdefault(x, x) != x:
-                parent[x] = find(parent[x])
-            return parent[x]
+            # 迭代版路径压缩：先找到根，再一路压缩
+            root = x
+            # 查找根节点
+            while True:
+                root_parent = parent.setdefault(root, root)
+                if root_parent == root:
+                    break
+                root = root_parent
+            # 路径压缩
+            while x != root:
+                px = parent[x]
+                parent[x] = root
+                x = px
+            return root
 
         def union(a: str, b: str) -> None:
             ra, rb = find(a), find(b)
