@@ -22,15 +22,32 @@ dependencies = [
     "datasets>=2.0.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = [
     "pytest>=7.0.0",
     "black>=23.0.0",
     "ruff>=0.1.0",
 ]
 
-[tool.uv]
-dev-dependencies = []
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "benchmarks",
+    "experiments",
+    "scripts",
+    "test_lance_api",
+    "query_lancedb.py",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/benchmarks",
+    "/experiments",
+    "/scripts",
+    "/test_lance_api",
+    "/query_lancedb.py",
+    "/README.md",
+    "/pyproject.toml",
+]
 
 [tool.black]
 line-length = 100
