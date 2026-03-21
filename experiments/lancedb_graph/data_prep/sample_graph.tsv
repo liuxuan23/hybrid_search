@@ -1,0 +1,12 @@
+head_type	head	relation	tail_type	tail
+user	user:alice	follows	user	user:bob
+user	user:alice	likes	item	item:laptop
+user	user:bob	likes	item	item:laptop
+user	user:bob	follows	user	user:carol
+user	user:carol	likes	item	item:camera
+user	user:carol	member_of	group	group:ml
+user	user:alice	member_of	group	group:ml
+group	group:ml	contains	topic	topic:retrieval
+item	item:laptop	belongs_to	brand	brand:lenovo
+item	item:camera	belongs_to	brand	brand:sony
+user	user:dave	follows	user	user:alice
