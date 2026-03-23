@@ -13,17 +13,16 @@ def build_adjacency_index_dataframe(
     当前实现采用“每节点一行”的简化邻接索引模型：
 
     1. `nodes_df` 中每个节点对应 `adj_index` 中的一行。
-    2. 这一行中保存该节点的：
-       - 出邻居在 `adj_index` 中的 row id 列表
-       - 入邻居在 `adj_index` 中的 row id 列表
-    3. `row_id` 这里不是先去依赖 Lance 表中已经存在的物理行号，
-       而是先基于当前 `nodes_df` 的顺序构建一个稳定的“预期行号映射”。
+     2. 这一行中先保存该节点的：
+         - 出邻居 node_id 列表
+         - 入邻居 node_id 列表
+     3. 最终物理 row_id 会在真正确定 `adj_index` 写入顺序之后再回填。
 
     这样做的目的，是先把阶段二最核心的数据结构表达清楚：
-    - `node_id -> row_id`
-    - `row_id -> neighbor_row_ids`
+    - `node_id -> adjacency row`
+    - `adjacency row -> neighbor node_ids`
 
-    后续如果需要和 Lance 中真实落盘后的 row id 做更严格对齐，可以再单独补一层校验。
+    这样可以把“邻接关系构建”与“物理 row_id 分配”两步解耦。
     """
     # 先显式校验输入列是否齐全。
     # 这样可以尽早发现上游数据构建的问题，避免后面在邻接回填阶段出现隐蔽错误。
@@ -47,10 +46,8 @@ def build_adjacency_index_dataframe(
     ordered_nodes_df = nodes_df.reset_index(drop=True).copy()
     node_ids = ordered_nodes_df["node_id"].tolist()
 
-    # `node_to_row_id` 是整个阶段二方案的核心映射之一：
-    # - 查询入口通常从 `node_id` 开始
-    # - 但真正的邻接跳转希望尽量走 `row_id -> row_id`
-    # 因此这里先基于节点顺序构造一个 node_id 到 row_id 的字典。
+    # `node_to_row_id` 仍然保留作为构建阶段的稳定顺序映射，
+    # 便于测试和调试；但最终不会直接写入表中作为邻接引用。
     node_to_row_id = {node_id: idx for idx, node_id in enumerate(node_ids)}
 
     # 为每个节点预先创建出邻居/入邻居列表容器。
@@ -58,10 +55,10 @@ def build_adjacency_index_dataframe(
     out_neighbors = {node_id: [] for node_id in node_ids}
     in_neighbors = {node_id: [] for node_id in node_ids}
 
-    # 遍历边表，把边关系转成“邻居 row_id”关系。
+    # 遍历边表，把边关系先转成“邻居 node_id”关系。
     # 例如：A -> B
-    # - 在 A 的 out_neighbor_row_ids 中追加 B 的 row_id
-    # - 在 B 的 in_neighbor_row_ids 中追加 A 的 row_id
+    # - 在 A 的 out_neighbor_node_ids 中追加 B
+    # - 在 B 的 in_neighbor_node_ids 中追加 A
     for row in edges_df.itertuples(index=False):
         src_id = row.src_id
         dst_id = row.dst_id
@@ -71,8 +68,8 @@ def build_adjacency_index_dataframe(
         if src_id not in node_to_row_id or dst_id not in node_to_row_id:
             continue
 
-        out_neighbors[src_id].append(node_to_row_id[dst_id])
-        in_neighbors[dst_id].append(node_to_row_id[src_id])
+        out_neighbors[src_id].append(dst_id)
+        in_neighbors[dst_id].append(src_id)
 
     # 将前面准备好的摘要信息和邻接列表重新组织成 `adj_index` 的行结构。
     # 这里每一行都代表一个节点的索引入口，后续查询应优先命中这里。
@@ -86,8 +83,8 @@ def build_adjacency_index_dataframe(
                 "cluster_id": cluster_assignments.get(node_id, "cluster::default"),
                 "degree_out": int(row.degree_out),
                 "degree_in": int(row.degree_in),
-                "out_neighbor_row_ids": out_neighbors[node_id],
-                "in_neighbor_row_ids": in_neighbors[node_id],
+                "out_neighbor_node_ids": out_neighbors[node_id],
+                "in_neighbor_node_ids": in_neighbors[node_id],
                 "attrs_json": row.attrs_json,
             }
         )

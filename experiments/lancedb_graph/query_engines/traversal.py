@@ -1,5 +1,6 @@
 import time
-from collections import deque
+
+from experiments.lancedb_graph.query_engines.adjacency_queries import _take_rows_with_row_id
 
 
 def query_k_hop_index(
@@ -8,7 +9,6 @@ def query_k_hop_index(
     k: int,
     materialize: bool = False,
     direction: str = "out",
-    logical_to_physical_row_id=None,
 ):
     """基于邻接索引执行 k-hop 扩展。
 
@@ -39,52 +39,59 @@ def query_k_hop_index(
         return _build_k_hop_result([], start, materialize, k, direction)
 
     visited = {node_id}
-    frontier = deque([(node_id, 0)])
+    frontier_node_ids = [node_id]
     discovered_rows = []
     discovered_node_ids = set()
     row_cache_by_node_id = {node_id: start_row}
-    row_cache_by_logical_row_id = {}
+    row_cache_by_physical_row_id = {}
 
-    start_logical_row_id = start_row.get("logical_row_id")
-    if start_logical_row_id is not None:
-        row_cache_by_logical_row_id[int(start_logical_row_id)] = start_row
+    start_physical_row_id = start_row.get("physical_row_id", start_row.get("_rowid"))
+    if start_physical_row_id is not None:
+        row_cache_by_physical_row_id[int(start_physical_row_id)] = start_row
 
-    while frontier:
-        current_node_id, depth = frontier.popleft()
-        if depth >= k:
-            continue
+    for _depth in range(k):
+        if not frontier_node_ids:
+            break
 
-        current_row = row_cache_by_node_id.get(current_node_id)
-        if current_row is None:
-            current_row = _get_row_by_node_id(adj_index_tbl, current_node_id)
-            if current_row is not None:
+        frontier_rows = []
+        for current_node_id in frontier_node_ids:
+            current_row = row_cache_by_node_id.get(current_node_id)
+            if current_row is None:
+                current_row = _get_row_by_node_id(adj_index_tbl, current_node_id)
+                if current_row is None:
+                    continue
                 row_cache_by_node_id[current_node_id] = current_row
-                current_logical_row_id = current_row.get("logical_row_id")
-                if current_logical_row_id is not None:
-                    row_cache_by_logical_row_id[int(current_logical_row_id)] = current_row
-        if current_row is None:
-            continue
+                current_physical_row_id = current_row.get("physical_row_id", current_row.get("_rowid"))
+                if current_physical_row_id is not None:
+                    row_cache_by_physical_row_id[int(current_physical_row_id)] = current_row
+            frontier_rows.append(current_row)
 
-        neighbor_row_ids = _get_neighbor_row_ids(current_row, direction)
+        aggregated_neighbor_row_ids = []
+        seen_neighbor_row_ids = set()
+        for current_row in frontier_rows:
+            for neighbor_row_id in _get_neighbor_row_ids(current_row, direction):
+                neighbor_row_id = int(neighbor_row_id)
+                if neighbor_row_id in seen_neighbor_row_ids:
+                    continue
+                seen_neighbor_row_ids.add(neighbor_row_id)
+                aggregated_neighbor_row_ids.append(neighbor_row_id)
+
         missing_row_ids = [
-            int(neighbor_row_id)
-            for neighbor_row_id in neighbor_row_ids
-            if int(neighbor_row_id) not in row_cache_by_logical_row_id
+            neighbor_row_id
+            for neighbor_row_id in aggregated_neighbor_row_ids
+            if neighbor_row_id not in row_cache_by_physical_row_id
         ]
         if missing_row_ids:
-            fetched_rows = _get_rows_by_logical_row_ids(
-                adj_index_tbl,
-                missing_row_ids,
-                logical_to_physical_row_id=logical_to_physical_row_id,
-            )
+            fetched_rows = _get_rows_by_physical_row_ids(adj_index_tbl, missing_row_ids)
             for row in fetched_rows:
-                logical_row_id = row.get("logical_row_id")
-                if logical_row_id is not None:
-                    row_cache_by_logical_row_id[int(logical_row_id)] = row
+                physical_row_id = row.get("physical_row_id", row.get("_rowid"))
+                if physical_row_id is not None:
+                    row_cache_by_physical_row_id[int(physical_row_id)] = row
                 row_cache_by_node_id[row["node_id"]] = row
 
-        for neighbor_row_id in neighbor_row_ids:
-            neighbor_row = row_cache_by_logical_row_id.get(int(neighbor_row_id))
+        next_frontier_node_ids = []
+        for neighbor_row_id in aggregated_neighbor_row_ids:
+            neighbor_row = row_cache_by_physical_row_id.get(int(neighbor_row_id))
             if neighbor_row is None:
                 continue
 
@@ -93,20 +100,19 @@ def query_k_hop_index(
                 continue
 
             visited.add(neighbor_node_id)
-            frontier.append((neighbor_node_id, depth + 1))
+            next_frontier_node_ids.append(neighbor_node_id)
 
             if neighbor_node_id not in discovered_node_ids:
                 discovered_node_ids.add(neighbor_node_id)
                 if materialize:
                     materialized_row = dict(neighbor_row)
                     materialized_row["row_id"] = int(neighbor_row_id)
-                    if logical_to_physical_row_id is not None:
-                        materialized_row["physical_row_id"] = logical_to_physical_row_id.get(
-                            int(neighbor_row_id)
-                        )
+                    materialized_row["physical_row_id"] = int(neighbor_row_id)
                     discovered_rows.append(materialized_row)
                 else:
                     discovered_rows.append({"row_id": int(neighbor_row_id)})
+
+        frontier_node_ids = next_frontier_node_ids
 
     return _build_k_hop_result(discovered_rows, start, materialize, k, direction)
 
@@ -119,32 +125,26 @@ def _get_row_by_node_id(adj_index_tbl, node_id: str):
     return df.to_dict("records")[0]
 
 
-def _get_rows_by_logical_row_ids(adj_index_tbl, logical_row_ids, logical_to_physical_row_id=None):
-    """按逻辑 row_id 批量回表读取邻接记录。"""
-    if not logical_row_ids:
-        return []
-
-    physical_row_ids = []
-    for logical_row_id in logical_row_ids:
-        physical_row_id = int(logical_row_id)
-        if logical_to_physical_row_id is not None:
-            mapped = logical_to_physical_row_id.get(int(logical_row_id))
-            if mapped is None:
-                continue
-            physical_row_id = int(mapped)
-        physical_row_ids.append(physical_row_id)
-
+def _get_rows_by_physical_row_ids(adj_index_tbl, physical_row_ids):
+    """按物理 row_id 批量回表读取邻接记录。"""
     if not physical_row_ids:
         return []
 
-    row_id_expr = _build_row_id_filter(physical_row_ids)
-    lance_ds = adj_index_tbl.to_lance()
-    arrow_tbl = lance_ds.to_table(with_row_id=True, filter=row_id_expr)
-    return arrow_tbl.to_pylist()
+    try:
+        df = _take_rows_with_row_id(adj_index_tbl, physical_row_ids)
+        if "_rowid" not in df.columns:
+            df = df.copy()
+            df["_rowid"] = sorted(set(int(row_id) for row_id in physical_row_ids))
+        return df.to_dict("records")
+    except Exception:
+        row_id_expr = _build_row_id_filter(physical_row_ids)
+        lance_ds = adj_index_tbl.to_lance()
+        arrow_tbl = lance_ds.to_table(with_row_id=True, filter=row_id_expr)
+        return arrow_tbl.to_pylist()
 
 
 def _get_neighbor_row_ids(row, direction: str):
-    """按方向提取当前节点的邻居逻辑 row_id 列表。"""
+    """按方向提取当前节点的邻居物理 row_id 列表。"""
     out_row_ids = _normalize_row_id_list(row.get("out_neighbor_row_ids"))
     in_row_ids = _normalize_row_id_list(row.get("in_neighbor_row_ids"))
 

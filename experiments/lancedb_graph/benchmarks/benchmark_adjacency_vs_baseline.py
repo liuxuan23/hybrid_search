@@ -30,6 +30,10 @@ def main():
     parser = argparse.ArgumentParser(description="对比 baseline 与 adjacency 查询性能")
     parser.add_argument("--input-path", type=str, default=DEFAULT_INPUT_TSV)
     parser.add_argument("--db-path", type=str, default=DEFAULT_DB_PATH)
+    # `sample_size` 表示“本轮 benchmark 随机抽取多少个起始节点做查询”。
+    # 例如：sample_size=100, repeat=3
+    # 则每一种查询类型会执行 100 * 3 = 300 次。
+    # 它不是返回结果条数，而是 benchmark 的采样节点数。
     parser.add_argument("--sample-size", type=int, default=DEFAULT_SMOKE_SAMPLE_SIZE)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--k-hop", type=int, default=DEFAULT_K_HOP)
@@ -56,6 +60,9 @@ def main():
     print(f"input_path: {args.input_path}")
     print(f"baseline_db_path: {baseline_db_path}")
     print(f"adjacency_db_path: {adjacency_db_path}")
+    # 这里打印的 `sample_size` 是实际采到的节点个数。
+    # 正常情况下它等于命令行传入的 `--sample-size`，
+    # 但如果图中节点总数不足，则会自动截断到节点总数。
     print(f"sample_size: {len(sample_nodes)}")
     print(f"repeat: {args.repeat}")
     print(f"k_hop: {args.k_hop}")
@@ -75,7 +82,7 @@ def main():
     adjacency_out_stats = _benchmark_query(
         sample_nodes,
         args.repeat,
-        lambda node_id: adjacency_graph.query_out_neighbors_index(node_id, materialize=False),
+        lambda node_id: adjacency_graph.query_out_neighbors_index(node_id, materialize=True),
     )
     adjacency_khop_stats = _benchmark_query(
         sample_nodes,
@@ -95,7 +102,13 @@ def main():
 
 
 def _sample_node_ids(graph: LanceDBGraphAdjacency, sample_size: int):
-    """从邻接图中采样节点列表。"""
+    """从邻接图中采样节点列表。
+
+    `sample_size` 的含义：
+    - 本轮 benchmark 选取多少个 node_id 作为查询起点
+    - 后续每种查询都会对这些 node_id 逐个执行
+    - 因此它决定了 benchmark 的样本规模，而不是查询结果规模
+    """
     graph._ensure_loaded()
     df = graph.adj_index_tbl.search().limit(graph.adj_index_tbl.count_rows()).to_pandas()
     if df.empty:
@@ -107,7 +120,21 @@ def _sample_node_ids(graph: LanceDBGraphAdjacency, sample_size: int):
 
 
 def _benchmark_query(node_ids, repeat: int, query_fn):
-    """重复执行查询并汇总延迟与结果规模。"""
+    """重复执行查询并汇总延迟与结果规模。
+
+    返回字段说明：
+    - `queries`:
+        实际执行的查询次数。
+        计算方式是：`len(node_ids) * repeat`。
+        例如采样 100 个节点、每个节点重复 3 次，则 queries=300。
+
+    - `avg_count`:
+        单次查询平均返回多少条结果。
+        这里的“结果条数”会根据查询类型复用其 `count` 字段：
+        - 单跳查询：通常表示返回的邻居数
+        - k-hop 查询：通常表示本次多跳扩展返回的总结果数
+        它不是执行次数，也不是节点总数，而是“平均每次 query 命中了多少结果”。
+    """
     latency_values = []
     count_values = []
 
@@ -132,6 +159,7 @@ def _extract_result_count(result):
     baseline `query_k_hop` 的 `rows` 是按 hop 分层的二维列表；
     其他查询一般直接返回扁平列表和 `count`。
     这里统一优先信任显式 `count`，不存在时再从 `rows` 推导。
+    这个值最终会参与 `avg_count` 统计。
     """
     if "count" in result:
         return result["count"]
@@ -162,6 +190,13 @@ def print_section(title: str):
 
 
 def print_benchmark_result(name: str, stats: dict):
+    # `queries`:
+    #   该 query 类型本轮一共执行了多少次。
+    #   一般等于 `sample_size * repeat`。
+    #
+    # `avg_count`:
+    #   该 query 类型平均每次返回多少条结果。
+    #   例如单跳时可理解为平均邻居数，2-hop 时可理解为平均多跳命中结果数。
     print(name)
     print(f"  queries: {stats['queries']}")
     print(f"  avg_time_ms: {stats['avg_time_ms']:.3f}")

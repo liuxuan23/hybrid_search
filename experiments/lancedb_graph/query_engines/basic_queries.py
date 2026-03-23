@@ -6,6 +6,17 @@ def _safe_where(table, condition: str):
     return table.search().where(condition).to_pandas()
 
 
+def _escape_sql_string(value: str) -> str:
+    return value.replace("'", "''")
+
+
+def _build_in_condition(column: str, values: set[str]) -> str:
+    quoted_values = ", ".join(
+        f"'{_escape_sql_string(value)}'" for value in sorted(values)
+    )
+    return f"{column} IN ({quoted_values})"
+
+
 def query_node_by_id(nodes_tbl, node_id: str):
     start = time.time()
     df = _safe_where(nodes_tbl, f"node_id = '{node_id}'")
@@ -71,17 +82,23 @@ def query_k_hop(edges_tbl, node_id: str, k: int):
     layers = []
 
     for _ in range(k):
+        if not frontier:
+            break
+
+        condition = _build_in_condition("src_id", frontier)
+        df = _safe_where(edges_tbl, condition)
+
         next_frontier = set()
         layer_rows = []
-        for current in frontier:
-            result = query_out_neighbors(edges_tbl, current)
-            for row in result["rows"]:
+        if not df.empty:
+            for row in df.to_dict("records"):
                 target = row["dst_id"]
                 if target in visited:
                     continue
                 visited.add(target)
                 next_frontier.add(target)
                 layer_rows.append(row)
+
         layers.append(layer_rows)
         frontier = next_frontier
         if not frontier:

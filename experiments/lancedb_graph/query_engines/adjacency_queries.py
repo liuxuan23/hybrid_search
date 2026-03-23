@@ -17,7 +17,6 @@ def query_out_neighbors_index(
     adj_index_tbl,
     node_id: str,
     materialize: bool = False,
-    logical_to_physical_row_id=None,
 ):
     """基于邻接索引查询出邻居。"""
     start = time.time()
@@ -31,7 +30,7 @@ def query_out_neighbors_index(
         rows = [{"row_id": row_id} for row_id in neighbor_row_ids]
         return _build_result(rows, start, materialize)
 
-    rows = _materialize_adj_rows(adj_index_tbl, neighbor_row_ids, logical_to_physical_row_id)
+    rows = _materialize_adj_rows(adj_index_tbl, neighbor_row_ids)
     return _build_result(rows, start, materialize)
 
 
@@ -39,7 +38,6 @@ def query_in_neighbors_index(
     adj_index_tbl,
     node_id: str,
     materialize: bool = False,
-    logical_to_physical_row_id=None,
 ):
     """基于邻接索引查询入邻居。"""
     start = time.time()
@@ -53,7 +51,7 @@ def query_in_neighbors_index(
         rows = [{"row_id": row_id} for row_id in neighbor_row_ids]
         return _build_result(rows, start, materialize)
 
-    rows = _materialize_adj_rows(adj_index_tbl, neighbor_row_ids, logical_to_physical_row_id)
+    rows = _materialize_adj_rows(adj_index_tbl, neighbor_row_ids)
     return _build_result(rows, start, materialize)
 
 
@@ -61,7 +59,6 @@ def query_neighbors_index(
     adj_index_tbl,
     node_id: str,
     materialize: bool = False,
-    logical_to_physical_row_id=None,
 ):
     """基于邻接索引查询双向邻居。"""
     start = time.time()
@@ -69,13 +66,11 @@ def query_neighbors_index(
         adj_index_tbl,
         node_id,
         materialize=materialize,
-        logical_to_physical_row_id=logical_to_physical_row_id,
     )
     in_result = query_in_neighbors_index(
         adj_index_tbl,
         node_id,
         materialize=materialize,
-        logical_to_physical_row_id=logical_to_physical_row_id,
     )
 
     rows = []
@@ -96,12 +91,12 @@ def query_neighbors_index(
     }
 
 
-def _materialize_adj_rows(adj_index_tbl, neighbor_row_ids, logical_to_physical_row_id=None):
+def _materialize_adj_rows(adj_index_tbl, neighbor_row_ids):
     """根据 row_id 列表回表获取邻接索引行。
 
     当前版本已从“整表读取”切换为“按需回表”：
-    1. 先把逻辑 row_id 映射成物理 row_id
-    2. 再基于 Lance 的 `_rowid` 元数据只读取目标记录
+    1. 邻接表中已直接存储物理 row_id
+    2. 因此可基于 Lance 的 `_rowid` 元数据直接读取目标记录
 
     这样做虽然还没有进一步做到批量 page 级优化，但已经避免了：
     - 每次查询都把整张 `adj_index` 拉到 pandas
@@ -110,21 +105,19 @@ def _materialize_adj_rows(adj_index_tbl, neighbor_row_ids, logical_to_physical_r
     if not neighbor_row_ids:
         return []
 
-    physical_row_ids = []
-    for row_id in neighbor_row_ids:
-        physical_row_id = row_id
-        if logical_to_physical_row_id is not None:
-            physical_row_id = logical_to_physical_row_id.get(row_id)
-
-        if physical_row_id is None:
-            continue
-        physical_row_ids.append(int(physical_row_id))
+    physical_row_ids = [int(row_id) for row_id in neighbor_row_ids]
 
     if not physical_row_ids:
         return []
 
-    row_id_expr = _build_row_id_filter(physical_row_ids)
-    df = _fetch_rows_with_row_id(adj_index_tbl, row_id_expr)
+    try:
+        df = _take_rows_with_row_id(adj_index_tbl, physical_row_ids)
+        if "_rowid" not in df.columns:
+            df = df.copy()
+            df["_rowid"] = sorted(set(int(row_id) for row_id in physical_row_ids))
+    except Exception:
+        row_id_expr = _build_row_id_filter(physical_row_ids)
+        df = _fetch_rows_with_row_id(adj_index_tbl, row_id_expr)
     if df.empty:
         return []
 
@@ -134,20 +127,13 @@ def _materialize_adj_rows(adj_index_tbl, neighbor_row_ids, logical_to_physical_r
 
     rows = []
     for row_id in neighbor_row_ids:
-        physical_row_id = row_id
-        if logical_to_physical_row_id is not None:
-            physical_row_id = logical_to_physical_row_id.get(row_id)
-
-        if physical_row_id is None:
-            continue
-
-        row = row_by_physical_row_id.get(int(physical_row_id))
+        row = row_by_physical_row_id.get(int(row_id))
         if row is None:
             continue
 
         materialized_row = dict(row)
-        materialized_row["row_id"] = row_id
-        materialized_row["physical_row_id"] = physical_row_id
+        materialized_row["row_id"] = int(row_id)
+        materialized_row["physical_row_id"] = int(row_id)
         rows.append(materialized_row)
     return rows
 
@@ -156,6 +142,14 @@ def _fetch_rows_with_row_id(adj_index_tbl, row_id_expr: str):
     """基于 `_rowid` 过滤条件按需读取目标邻接行。"""
     lance_ds = adj_index_tbl.to_lance()
     arrow_tbl = lance_ds.to_table(with_row_id=True, filter=row_id_expr)
+    return arrow_tbl.to_pandas()
+
+
+def _take_rows_with_row_id(adj_index_tbl, row_ids):
+    """优先使用 Lance `take` 直接按物理 row_id 抽取目标行。"""
+    lance_ds = adj_index_tbl.to_lance()
+    # 将待读取的row_id列表做规范化、去重、排序，确保 `take` 的输入符合预期。
+    arrow_tbl = lance_ds.take(sorted(set(int(row_id) for row_id in row_ids)))
     return arrow_tbl.to_pandas()
 
 

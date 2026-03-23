@@ -63,11 +63,6 @@ class LanceDBGraphAdjacency:
         self.nodes_tbl = None
         self.edges_tbl = None
         self.adj_index_tbl = None
-        # 该映射描述“构建邻接列表时使用的逻辑 row_id”到最终 `adj_index` 行的对应关系。
-        # 当前阶段二的 `out_neighbor_row_ids` / `in_neighbor_row_ids` 是在 DataFrame 构建阶段按
-        # `nodes_df` 顺序生成的；而 clustered 写入前又可能对 `adj_index_df` 做重排序。
-        # 因此 materialize 时不能直接把逻辑 row_id 当作 DataFrame 当前行号来取。
-        self.logical_to_physical_row_id = None
 
     def build_from_tsv(self, tsv_path: str, cluster_strategy: str = "by_node_type"):
         """从 TSV 构建 `nodes`、`edges` 和 `adj_index`。
@@ -102,20 +97,20 @@ class LanceDBGraphAdjacency:
             cluster_assignments=cluster_assignments,
         )
 
-        # 在 clustered 排序前，先保留原始逻辑 row_id。
-        # 这样即使后面为了局部性实验按 `cluster_id` 重排表，我们仍然能知道：
-        # “邻接列表里存的 row_id” 应该对应重排后的哪一行。
-        adj_index_df = adj_index_df.reset_index(drop=True).copy()
-        adj_index_df["logical_row_id"] = adj_index_df.index
-
-        # clustered 模式下，先按 `cluster_id` 排序写入。
-        # 这样做的目的不是改变业务语义，而是为局部性实验提供一个稳定的聚簇版本。
+        # 当前阶段切换到“邻接表直接存物理 row_id”。
+        # 因此需要先确定最终写入顺序，再基于这个顺序重新回填邻居 row_id。
         adj_index_df = adj_index_df.sort_values(["cluster_id", "node_id"]).reset_index(drop=True)
-
-        # 构造逻辑 row_id -> 当前物理行号的映射，供 materialize 阶段使用。
-        self.logical_to_physical_row_id = {
-            int(row.logical_row_id): idx for idx, row in enumerate(adj_index_df.itertuples(index=False))
+        node_to_physical_row_id = {
+            row.node_id: idx for idx, row in enumerate(adj_index_df.itertuples(index=False))
         }
+        adj_index_df["physical_row_id"] = adj_index_df["node_id"].map(node_to_physical_row_id).astype(int)
+        adj_index_df["out_neighbor_row_ids"] = adj_index_df["out_neighbor_node_ids"].apply(
+            lambda node_ids: [node_to_physical_row_id[node_id] for node_id in node_ids]
+        )
+        adj_index_df["in_neighbor_row_ids"] = adj_index_df["in_neighbor_node_ids"].apply(
+            lambda node_ids: [node_to_physical_row_id[node_id] for node_id in node_ids]
+        )
+        adj_index_df = adj_index_df.drop(columns=["out_neighbor_node_ids", "in_neighbor_node_ids"])
 
         if OVERWRITE_TABLES:
             # `list_tables()` 在当前 LanceDB 版本中返回的元素可能不是纯字符串，
@@ -150,7 +145,6 @@ class LanceDBGraphAdjacency:
         self.nodes_tbl = self.db[self.nodes_table_name]
         self.edges_tbl = self.db[self.edges_table_name]
         self.adj_index_tbl = self.db[self.adj_index_table_name]
-        self.logical_to_physical_row_id = self._load_logical_to_physical_mapping()
         return self
 
     def stats(self):
@@ -186,7 +180,6 @@ class LanceDBGraphAdjacency:
             self.adj_index_tbl,
             node_id,
             materialize=materialize,
-            logical_to_physical_row_id=self.logical_to_physical_row_id,
         )
 
     def query_in_neighbors_index(self, node_id: str, materialize: bool = False):
@@ -196,7 +189,6 @@ class LanceDBGraphAdjacency:
             self.adj_index_tbl,
             node_id,
             materialize=materialize,
-            logical_to_physical_row_id=self.logical_to_physical_row_id,
         )
 
     def query_neighbors_index(self, node_id: str, materialize: bool = False):
@@ -206,7 +198,6 @@ class LanceDBGraphAdjacency:
             self.adj_index_tbl,
             node_id,
             materialize=materialize,
-            logical_to_physical_row_id=self.logical_to_physical_row_id,
         )
 
     def query_k_hop_index(
@@ -230,7 +221,6 @@ class LanceDBGraphAdjacency:
             k=k,
             materialize=materialize,
             direction=direction,
-            logical_to_physical_row_id=self.logical_to_physical_row_id,
         )
 
     def query_out_neighbors_baseline(self, node_id: str):
@@ -263,13 +253,6 @@ class LanceDBGraphAdjacency:
         """确保三张核心表已加载。"""
         if self.nodes_tbl is None or self.edges_tbl is None or self.adj_index_tbl is None:
             self.load()
-
-    def _load_logical_to_physical_mapping(self):
-        """从 `adj_index` 表中恢复逻辑 row_id 到物理行号的映射。"""
-        df = self.adj_index_tbl.search().limit(self.adj_index_tbl.count_rows()).to_pandas()
-        if "logical_row_id" not in df.columns:
-            return None
-        return {int(row.logical_row_id): idx for idx, row in enumerate(df.itertuples(index=False))}
 
     def _write_dataframe_in_batches(self, table_name: str, df):
         """按批量写入 LanceDB。
