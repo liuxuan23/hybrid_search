@@ -1,7 +1,11 @@
 import os
+import json
 
 from experiments.lancedb_graph.data_prep.build_adjacency_index import build_adjacency_index_dataframe
-from experiments.lancedb_graph.data_prep.generate_synthetic_graph import generate_edges
+from experiments.lancedb_graph.data_prep.generate_synthetic_graph import (
+    generate_edges,
+    write_node_communities_json,
+)
 from experiments.lancedb_graph.data_prep.build_graph_tables import build_graph_dataframes_from_tsv
 from experiments.lancedb_graph.query_engines.adjacency_queries import (
     _normalize_row_id_list,
@@ -162,7 +166,7 @@ def test_baseline_k_hop_query_returns_layered_rows():
 
 def test_large_synthetic_graph_adjacency_build_is_consistent():
     """验证较大 synthetic 图上邻接表的度数与邻居列表长度保持一致。"""
-    edges = generate_edges(
+    edges, _ = generate_edges(
         graph_mode="uniform",
         num_nodes=2000,
         num_edges=10000,
@@ -194,3 +198,46 @@ def test_large_synthetic_graph_adjacency_build_is_consistent():
         assert row["degree_out"] == len(out_neighbor_row_ids)
         assert row["degree_in"] == len(in_neighbor_row_ids)
         assert row["physical_row_id"] >= 0
+
+
+def test_community_graph_builds_nodes_with_community_id_and_clustering():
+    """验证 community 图会生成 community_id，并可用于 adjacency community 聚簇。"""
+    synthetic_tsv_path = os.path.join(TEST_DB_PATH, "synthetic_community_validation.tsv")
+    os.makedirs(os.path.dirname(synthetic_tsv_path), exist_ok=True)
+
+    edges, node_community_map = generate_edges(
+        graph_mode="community",
+        num_nodes=60,
+        num_edges=300,
+        num_relations=8,
+        num_node_types=6,
+        seed=11,
+        num_communities=5,
+        intra_ratio=0.9,
+    )
+
+    with open(synthetic_tsv_path, "w", encoding="utf-8") as f:
+        f.write("head_type\thead\trelation\ttail_type\ttail\n")
+        for src_type, src_id, relation, dst_type, dst_id in edges:
+            f.write(f"{src_type}\t{src_id}\t{relation}\t{dst_type}\t{dst_id}\n")
+
+    community_path = write_node_communities_json(synthetic_tsv_path, node_community_map)
+    assert os.path.exists(community_path)
+
+    with open(community_path, "r", encoding="utf-8") as f:
+        loaded_map = json.load(f)
+    assert len(loaded_map) == len(node_community_map)
+
+    nodes_df, _edges_df = build_graph_dataframes_from_tsv(synthetic_tsv_path)
+    assert "community_id" in nodes_df.columns
+    assert nodes_df["community_id"].notna().all()
+
+    graph = LanceDBGraphAdjacency(db_path=os.path.join(TEST_DB_PATH, "community_cluster_case"))
+    graph.build_from_tsv(synthetic_tsv_path, cluster_strategy="community")
+
+    adj_df = graph.adj_index_tbl.to_pandas().sort_values("physical_row_id").reset_index(drop=True)
+    assert adj_df["cluster_id"].str.startswith("community::").all()
+
+    cluster_ids = adj_df["cluster_id"].tolist()
+    switch_count = sum(1 for idx in range(1, len(cluster_ids)) if cluster_ids[idx] != cluster_ids[idx - 1])
+    assert switch_count <= adj_df["cluster_id"].nunique() - 1

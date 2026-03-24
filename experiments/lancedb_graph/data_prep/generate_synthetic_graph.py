@@ -1,5 +1,6 @@
 import argparse
 import csv
+import json
 import os
 import random
 
@@ -22,6 +23,8 @@ def build_node_ids(num_nodes: int, num_node_types: int):
     for idx in range(num_nodes):
         node_type = node_types[idx % num_node_types]
         node_ids.append((node_type, f"{node_type}:node_{idx}"))
+    # 打乱 node_id 顺序
+    random.shuffle(node_ids)
     return node_ids
 
 
@@ -52,6 +55,14 @@ def build_communities(node_ids, num_communities: int):
     return communities
 
 
+def build_node_community_map(node_ids, num_communities: int):
+    """为每个节点分配稳定的 community_id。"""
+    node_community_map = {}
+    for idx, (_node_type, node_id) in enumerate(node_ids):
+        node_community_map[node_id] = idx % num_communities
+    return node_community_map
+
+
 def choose_community_edge(node_ids, relation_names, communities, intra_ratio: float, rng):
     # 以较高概率在同一社区内采样边，制造“社区内稠密、社区间稀疏”的结构。
     if rng.random() < intra_ratio:
@@ -80,7 +91,9 @@ def generate_edges(
     rng = random.Random(seed)
     node_ids = build_node_ids(num_nodes, num_node_types)
     relation_names = build_relation_names(num_relations)
+    # 打乱后的 node_ids 用于分 community
     communities = build_communities(node_ids, num_communities)
+    node_community_map = build_node_community_map(node_ids, num_communities)
 
     edges = []
     for _ in range(num_edges):
@@ -99,7 +112,7 @@ def generate_edges(
         else:
             raise ValueError(f"不支持的 graph_mode: {graph_mode}")
         edges.append(edge)
-    return edges
+    return edges, node_community_map
 
 
 def write_edges_tsv(output_path: str, edges):
@@ -108,6 +121,15 @@ def write_edges_tsv(output_path: str, edges):
         writer = csv.writer(f, delimiter="\t")
         writer.writerow(["head_type", "head", "relation", "tail_type", "tail"])
         writer.writerows(edges)
+
+
+def write_node_communities_json(output_path: str, node_community_map):
+    """将节点 community_id 映射写入伴随文件。"""
+    community_path = f"{output_path}.communities.json"
+    ensure_parent_dir(community_path)
+    with open(community_path, "w", encoding="utf-8") as f:
+        json.dump(node_community_map, f, ensure_ascii=False, sort_keys=True)
+    return community_path
 
 
 def default_output_path(graph_mode: str, num_edges: int):
@@ -134,7 +156,7 @@ def main():
     args = parser.parse_args()
 
     output_path = args.output_path or default_output_path(args.graph_mode, args.num_edges)
-    edges = generate_edges(
+    edges, node_community_map = generate_edges(
         graph_mode=args.graph_mode,
         num_nodes=args.num_nodes,
         num_edges=args.num_edges,
@@ -145,12 +167,17 @@ def main():
         intra_ratio=args.intra_ratio,
     )
     write_edges_tsv(output_path, edges)
+    community_path = None
+    if args.graph_mode == "community":
+        community_path = write_node_communities_json(output_path, node_community_map)
 
     print("图数据生成完成")
     print(f"graph_mode: {args.graph_mode}")
     print(f"num_nodes: {args.num_nodes}")
     print(f"num_edges: {args.num_edges}")
     print(f"output_path: {output_path}")
+    if community_path:
+        print(f"community_path: {community_path}")
 
 
 if __name__ == "__main__":

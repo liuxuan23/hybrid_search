@@ -31,3 +31,21 @@ def assign_clusters_by_hash(nodes_df: pd.DataFrame, num_buckets: int) -> Dict[st
         bucket = hash(node_id) % num_buckets
         assignments[node_id] = f"hash::{bucket}"
     return assignments
+
+
+def assign_clusters_by_community(nodes_df: pd.DataFrame) -> Dict[str, str]:
+    """按 `community_id` 生成 cluster_id。"""
+    if "node_id" not in nodes_df.columns:
+        raise ValueError("nodes_df 缺少 node_id 列")
+    if "community_id" not in nodes_df.columns:
+        raise ValueError("nodes_df 缺少 community_id 列")
+
+    assignments = {}
+    for row in nodes_df.itertuples(index=False):
+        node_id = row.node_id
+        community_id = row.community_id
+        if community_id is None or pd.isna(community_id):
+            assignments[node_id] = "community::unknown"
+            continue
+        assignments[node_id] = f"community::{int(community_id)}"
+    return assignments

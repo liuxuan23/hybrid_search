@@ -12,6 +12,7 @@ from experiments.lancedb_graph.config import (
 )
 from experiments.lancedb_graph.data_prep.build_adjacency_index import build_adjacency_index_dataframe
 from experiments.lancedb_graph.data_prep.build_cluster_assignments import (
+    assign_clusters_by_community,
     assign_clusters_by_hash,
     assign_clusters_by_node_type,
 )
@@ -97,9 +98,8 @@ class LanceDBGraphAdjacency:
             cluster_assignments=cluster_assignments,
         )
 
-        # 当前阶段切换到“邻接表直接存物理 row_id”。
-        # 因此需要先确定最终写入顺序，再基于这个顺序重新回填邻居 row_id。
-        adj_index_df = adj_index_df.sort_values(["cluster_id", "node_id"]).reset_index(drop=True)
+        # 只按 cluster_id 排序，不再二次按 node_id 排序
+        adj_index_df = adj_index_df.sort_values(["cluster_id"]).reset_index(drop=True)
         node_to_physical_row_id = {
             row.node_id: idx for idx, row in enumerate(adj_index_df.itertuples(index=False))
         }
@@ -239,12 +239,15 @@ class LanceDBGraphAdjacency:
         当前仅支持最基础、最稳定的两类策略：
         - `by_node_type`: 便于解释，也方便在 synthetic 数据上快速验证
         - `hash`: 作为一个不依赖业务语义的均匀分桶基线
+        - `community`: 按节点所属社区聚簇，适合 community graph 实验
         - `none`: 不做语义聚簇，仅保留构建时原始节点顺序
         """
         if cluster_strategy == "none":
             return {node_id: "default" for node_id in nodes_df["node_id"].tolist()}
         if cluster_strategy == "by_node_type":
             return assign_clusters_by_node_type(nodes_df)
+        if cluster_strategy == "community":
+            return assign_clusters_by_community(nodes_df)
         if cluster_strategy == "hash":
             return assign_clusters_by_hash(nodes_df, num_buckets=16)
         raise ValueError(f"不支持的 cluster_strategy: {cluster_strategy}")

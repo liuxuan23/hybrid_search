@@ -1,4 +1,6 @@
 import csv
+import json
+import os
 from collections import defaultdict
 from typing import Tuple
 
@@ -28,6 +30,7 @@ def build_graph_dataframes_from_tsv(tsv_path: str) -> Tuple[pd.DataFrame, pd.Dat
     degree_out = defaultdict(int)
     degree_in = defaultdict(int)
     edge_rows = []
+    node_community_map = _load_node_community_map(tsv_path)
 
     with open(tsv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f, delimiter="\t")
@@ -46,12 +49,14 @@ def build_graph_dataframes_from_tsv(tsv_path: str) -> Tuple[pd.DataFrame, pd.Dat
                     "node_id": src_id,
                     "node_type": src_type,
                     "attrs_json": DEFAULT_ATTRS_JSON,
+                    "community_id": node_community_map.get(src_id),
                 }
             if dst_id not in node_info:
                 node_info[dst_id] = {
                     "node_id": dst_id,
                     "node_type": dst_type,
                     "attrs_json": DEFAULT_ATTRS_JSON,
+                    "community_id": node_community_map.get(dst_id),
                 }
 
             edge_rows.append(
@@ -74,6 +79,7 @@ def build_graph_dataframes_from_tsv(tsv_path: str) -> Tuple[pd.DataFrame, pd.Dat
                 "node_type": info["node_type"],
                 "degree_out": degree_out[node_id],
                 "degree_in": degree_in[node_id],
+                "community_id": info.get("community_id"),
                 "attrs_json": info["attrs_json"],
             }
         )
@@ -81,3 +87,14 @@ def build_graph_dataframes_from_tsv(tsv_path: str) -> Tuple[pd.DataFrame, pd.Dat
     nodes_df = pd.DataFrame(node_rows)
     edges_df = pd.DataFrame(edge_rows)
     return nodes_df, edges_df
+
+
+def _load_node_community_map(tsv_path: str):
+    """如果存在伴随 community 文件，则加载节点到 community_id 的映射。"""
+    community_path = f"{tsv_path}.communities.json"
+    if not os.path.exists(community_path):
+        return {}
+
+    with open(community_path, "r", encoding="utf-8") as f:
+        loaded = json.load(f)
+    return {node_id: int(community_id) for node_id, community_id in loaded.items()}

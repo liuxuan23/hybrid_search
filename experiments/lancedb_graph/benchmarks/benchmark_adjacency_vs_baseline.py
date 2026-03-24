@@ -82,7 +82,7 @@ def main():
     adjacency_out_stats = _benchmark_query(
         sample_nodes,
         args.repeat,
-        lambda node_id: adjacency_graph.query_out_neighbors_index(node_id, materialize=True),
+        lambda node_id: adjacency_graph.query_out_neighbors_index(node_id, materialize=False),
     )
     adjacency_khop_stats = _benchmark_query(
         sample_nodes,
