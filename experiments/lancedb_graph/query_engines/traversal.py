@@ -1,6 +1,10 @@
 import time
 
-from experiments.lancedb_graph.query_engines.adjacency_queries import _take_rows_with_row_id
+from experiments.lancedb_graph.query_engines.adjacency_queries import (
+    _build_io_stats,
+    _read_process_io_bytes,
+    _take_rows_with_row_id,
+)
 
 
 def query_k_hop_index(
@@ -34,9 +38,10 @@ def query_k_hop_index(
         raise ValueError(f"不支持的 direction: {direction}")
 
     start = time.perf_counter()
+    io_before = _read_process_io_bytes()
     start_row = _get_row_by_node_id(adj_index_tbl, node_id)
     if start_row is None:
-        return _build_k_hop_result([], start, materialize, k, direction)
+        return _build_k_hop_result([], start, materialize, k, direction, io_before)
 
     visited = {node_id}
     frontier_node_ids = [node_id]
@@ -52,6 +57,13 @@ def query_k_hop_index(
     for _depth in range(k):
         if not frontier_node_ids:
             break
+
+        frontier_node_ids = _reorder_frontier_node_ids(
+            frontier_node_ids,
+            row_cache_by_node_id=row_cache_by_node_id,
+            adj_index_tbl=adj_index_tbl,
+            row_cache_by_physical_row_id=row_cache_by_physical_row_id,
+        )
 
         frontier_rows = []
         for current_node_id in frontier_node_ids:
@@ -114,7 +126,7 @@ def query_k_hop_index(
 
         frontier_node_ids = next_frontier_node_ids
 
-    return _build_k_hop_result(discovered_rows, start, materialize, k, direction)
+    return _build_k_hop_result(discovered_rows, start, materialize, k, direction, io_before)
 
 
 def _get_row_by_node_id(adj_index_tbl, node_id: str):
@@ -183,7 +195,7 @@ def _normalize_row_id_list(value):
         return []
 
 
-def _build_k_hop_result(rows, start_time, materialize: bool, k: int, direction: str):
+def _build_k_hop_result(rows, start_time, materialize: bool, k: int, direction: str, io_before):
     """统一封装 k-hop 查询返回格式。"""
     return {
         "rows": rows,
@@ -192,6 +204,7 @@ def _build_k_hop_result(rows, start_time, materialize: bool, k: int, direction: 
         "mode": "materialized" if materialize else "index-only",
         "k": k,
         "direction": direction,
+        "io_stats": _build_io_stats(io_before),
     }
 
 
@@ -202,3 +215,33 @@ def _build_row_id_filter(row_ids):
         return f"_rowid = {unique_row_ids[0]}"
     joined = ", ".join(str(row_id) for row_id in unique_row_ids)
     return f"_rowid IN ({joined})"
+
+
+def _reorder_frontier_node_ids(
+    frontier_node_ids,
+    row_cache_by_node_id,
+    adj_index_tbl,
+    row_cache_by_physical_row_id,
+):
+    """按 cluster_id 与 physical_row_id 重排当前层 frontier。"""
+    reordered_rows = []
+
+    for node_id in frontier_node_ids:
+        row = row_cache_by_node_id.get(node_id)
+        if row is None:
+            row = _get_row_by_node_id(adj_index_tbl, node_id)
+            if row is None:
+                continue
+            row_cache_by_node_id[node_id] = row
+            physical_row_id = row.get("physical_row_id", row.get("_rowid"))
+            if physical_row_id is not None:
+                row_cache_by_physical_row_id[int(physical_row_id)] = row
+        reordered_rows.append(row)
+
+    reordered_rows.sort(
+        key=lambda row: (
+            str(row.get("cluster_id", "")),
+            int(row.get("physical_row_id", row.get("_rowid", 0))),
+        )
+    )
+    return [row["node_id"] for row in reordered_rows]

@@ -137,19 +137,28 @@ def _benchmark_query(node_ids, repeat: int, query_fn):
     """
     latency_values = []
     count_values = []
+    read_bytes_values = []
 
     for _ in range(max(1, int(repeat))):
         for node_id in node_ids:
             result = query_fn(node_id)
             latency_values.append(float(result["time_ms"]))
             count_values.append(int(_extract_result_count(result)))
+            read_bytes_values.append(int(result.get("io_stats", {}).get("read_bytes", 0)))
+
+    total_time_ms = sum(latency_values)
+    query_count = len(latency_values)
 
     return {
-        "queries": len(latency_values),
+        "queries": query_count,
+        "total_time_ms": total_time_ms,
         "avg_time_ms": statistics.fmean(latency_values) if latency_values else 0.0,
         "p50_time_ms": _percentile(latency_values, 50),
         "p95_time_ms": _percentile(latency_values, 95),
         "avg_count": statistics.fmean(count_values) if count_values else 0.0,
+        "throughput_qps": (query_count / (total_time_ms / 1000.0)) if total_time_ms > 0 else 0.0,
+        "avg_read_bytes": statistics.fmean(read_bytes_values) if read_bytes_values else 0.0,
+        "total_read_bytes": sum(read_bytes_values),
     }
 
 
@@ -203,6 +212,9 @@ def print_benchmark_result(name: str, stats: dict):
     print(f"  p50_time_ms: {stats['p50_time_ms']:.3f}")
     print(f"  p95_time_ms: {stats['p95_time_ms']:.3f}")
     print(f"  avg_count: {stats['avg_count']:.3f}")
+    print(f"  throughput_qps: {stats['throughput_qps']:.3f}")
+    print(f"  avg_read_bytes: {stats['avg_read_bytes']:.3f}")
+    print(f"  total_read_bytes: {stats['total_read_bytes']}")
 
 
 if __name__ == "__main__":

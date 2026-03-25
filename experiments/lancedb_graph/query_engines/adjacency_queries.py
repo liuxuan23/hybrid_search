@@ -20,18 +20,19 @@ def query_out_neighbors_index(
 ):
     """基于邻接索引查询出邻居。"""
     start = time.time()
+    io_before = _read_process_io_bytes()
     entry_result = get_adj_entry(adj_index_tbl, node_id)
     if entry_result["count"] == 0:
-        return _build_result([], start, materialize)
+        return _build_result([], start, materialize, io_before)
 
     entry = entry_result["rows"][0]
     neighbor_row_ids = _normalize_row_id_list(entry.get("out_neighbor_row_ids"))
     if not materialize:
         rows = [{"row_id": row_id} for row_id in neighbor_row_ids]
-        return _build_result(rows, start, materialize)
+        return _build_result(rows, start, materialize, io_before)
 
     rows = _materialize_adj_rows(adj_index_tbl, neighbor_row_ids)
-    return _build_result(rows, start, materialize)
+    return _build_result(rows, start, materialize, io_before)
 
 
 def query_in_neighbors_index(
@@ -41,18 +42,19 @@ def query_in_neighbors_index(
 ):
     """基于邻接索引查询入邻居。"""
     start = time.time()
+    io_before = _read_process_io_bytes()
     entry_result = get_adj_entry(adj_index_tbl, node_id)
     if entry_result["count"] == 0:
-        return _build_result([], start, materialize)
+        return _build_result([], start, materialize, io_before)
 
     entry = entry_result["rows"][0]
     neighbor_row_ids = _normalize_row_id_list(entry.get("in_neighbor_row_ids"))
     if not materialize:
         rows = [{"row_id": row_id} for row_id in neighbor_row_ids]
-        return _build_result(rows, start, materialize)
+        return _build_result(rows, start, materialize, io_before)
 
     rows = _materialize_adj_rows(adj_index_tbl, neighbor_row_ids)
-    return _build_result(rows, start, materialize)
+    return _build_result(rows, start, materialize, io_before)
 
 
 def query_neighbors_index(
@@ -62,6 +64,7 @@ def query_neighbors_index(
 ):
     """基于邻接索引查询双向邻居。"""
     start = time.time()
+    io_before = _read_process_io_bytes()
     out_result = query_out_neighbors_index(
         adj_index_tbl,
         node_id,
@@ -88,6 +91,7 @@ def query_neighbors_index(
         "count": len(rows),
         "time_ms": (time.time() - start) * 1000,
         "mode": "materialized" if materialize else "index-only",
+        "io_stats": _build_io_stats(io_before),
     }
 
 
@@ -182,11 +186,43 @@ def _normalize_row_id_list(value):
     return list(value)
 
 
-def _build_result(rows, start_time: float, materialize: bool):
+def _build_result(rows, start_time: float, materialize: bool, io_before=None):
     """统一构造索引查询结果。"""
     return {
         "rows": rows,
         "count": len(rows),
         "time_ms": (time.time() - start_time) * 1000,
         "mode": "materialized" if materialize else "index-only",
+        "io_stats": _build_io_stats(io_before),
+    }
+
+
+def _read_process_io_bytes():
+    """读取当前进程的 Linux `/proc/self/io` 统计。"""
+    try:
+        with open("/proc/self/io", "r", encoding="utf-8") as f:
+            values = {}
+            for line in f:
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                values[key.strip()] = int(value.strip())
+        return {
+            "read_bytes": values.get("read_bytes", 0),
+            "write_bytes": values.get("write_bytes", 0),
+        }
+    except Exception:
+        return {
+            "read_bytes": 0,
+            "write_bytes": 0,
+        }
+
+
+def _build_io_stats(io_before):
+    """构造本次查询的 IO 增量统计。"""
+    io_after = _read_process_io_bytes()
+    io_before = io_before or {"read_bytes": 0, "write_bytes": 0}
+    return {
+        "read_bytes": max(0, io_after["read_bytes"] - io_before.get("read_bytes", 0)),
+        "write_bytes": max(0, io_after["write_bytes"] - io_before.get("write_bytes", 0)),
     }
