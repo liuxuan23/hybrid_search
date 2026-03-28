@@ -44,6 +44,8 @@ storage/
 lanceDB/
 *.lance/
 *.db
+experiments/**/results/
+results/
 
 # 测试输出
 .pytest_cache/

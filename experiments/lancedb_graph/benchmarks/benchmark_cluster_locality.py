@@ -3,6 +3,7 @@ import os
 import random
 import statistics
 
+from experiments.lancedb_graph.benchmarks.cache_utils import drop_os_caches
 from experiments.lancedb_graph.config import (
     DEFAULT_DB_PATH,
     DEFAULT_INPUT_TSV,
@@ -37,6 +38,9 @@ def main():
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--k-hop", type=int, default=DEFAULT_K_HOP)
     parser.add_argument("--clustered-strategy", type=str, default="by_node_type")
+    parser.add_argument("--cache-mode", type=str, choices=["cold", "warm", "mixed"], default="mixed")
+    parser.add_argument("--warmup-runs", type=int, default=1)
+    parser.add_argument("--drop-cache-command", type=str, default="")
     args = parser.parse_args()
 
     random.seed(DEFAULT_RANDOM_SEED)
@@ -49,6 +53,10 @@ def main():
 
     unclustered_graph = LanceDBGraphAdjacency(db_path=unclustered_db_path)
     unclustered_graph.build_from_tsv(args.input_path, cluster_strategy="none")
+
+    # 先完成图对象和表句柄初始化，避免 cold benchmark 把首次进程/表加载噪声混入统计。
+    clustered_graph._ensure_loaded()
+    unclustered_graph._ensure_loaded()
 
     sample_nodes = _sample_node_ids(clustered_graph, args.sample_size)
     if not sample_nodes:
@@ -63,21 +71,35 @@ def main():
     print(f"repeat: {args.repeat}")
     print(f"k_hop: {args.k_hop}")
     print(f"clustered_strategy: {args.clustered_strategy}")
+    print(f"cache_mode: {args.cache_mode}")
+    print(f"warmup_runs: {args.warmup_runs}")
 
     print_section("运行 clustered / unclustered 对比")
     clustered_single_hop = _benchmark_query(
         sample_nodes,
         args.repeat,
+        args.cache_mode,
+        args.warmup_runs,
+        args.drop_cache_command,
+        "clustered_single_hop_materialized",
         lambda node_id: clustered_graph.query_out_neighbors_index(node_id, materialize=True),
     )
     unclustered_single_hop = _benchmark_query(
         sample_nodes,
         args.repeat,
+        args.cache_mode,
+        args.warmup_runs,
+        args.drop_cache_command,
+        "unclustered_single_hop_materialized",
         lambda node_id: unclustered_graph.query_out_neighbors_index(node_id, materialize=True),
     )
     clustered_khop = _benchmark_query(
         sample_nodes,
         args.repeat,
+        args.cache_mode,
+        args.warmup_runs,
+        args.drop_cache_command,
+        f"clustered_{args.k_hop}_hop_materialized",
         lambda node_id: clustered_graph.query_k_hop_index(
             node_id,
             k=args.k_hop,
@@ -88,6 +110,10 @@ def main():
     unclustered_khop = _benchmark_query(
         sample_nodes,
         args.repeat,
+        args.cache_mode,
+        args.warmup_runs,
+        args.drop_cache_command,
+        f"unclustered_{args.k_hop}_hop_materialized",
         lambda node_id: unclustered_graph.query_k_hop_index(
             node_id,
             k=args.k_hop,
@@ -120,12 +146,37 @@ def _sample_node_ids(graph: LanceDBGraphAdjacency, sample_size: int):
     return random.sample(node_ids, sample_size)
 
 
-def _benchmark_query(node_ids, repeat: int, query_fn):
+def _benchmark_query(
+    node_ids,
+    repeat: int,
+    cache_mode: str,
+    warmup_runs: int,
+    drop_cache_command: str,
+    benchmark_name: str,
+    query_fn,
+):
     """重复执行查询并输出统一统计。"""
     latency_values = []
     count_values = []
     locality_metric_rows = []
     read_bytes_values = []
+    cache_drop_stats = {
+        "cache_drop_supported": False,
+        "cache_drop_success": False,
+        "cache_drop_error": "",
+    }
+
+    if cache_mode == "cold":
+        cache_drop_stats = drop_os_caches(drop_cache_command)
+
+    # cold 模式下丢弃一次未计时 probe，尽量把首次懒加载/内部初始化噪声排除在正式统计之外。
+    if cache_mode == "cold" and node_ids:
+        query_fn(node_ids[0])
+
+    if cache_mode == "warm":
+        for _ in range(max(0, int(warmup_runs))):
+            for node_id in node_ids:
+                query_fn(node_id)
 
     for _ in range(max(1, int(repeat))):
         for node_id in node_ids:
@@ -148,6 +199,11 @@ def _benchmark_query(node_ids, repeat: int, query_fn):
         "throughput_qps": (query_count / (total_time_ms / 1000.0)) if total_time_ms > 0 else 0.0,
         "avg_read_bytes": statistics.fmean(read_bytes_values) if read_bytes_values else 0.0,
         "total_read_bytes": sum(read_bytes_values),
+        "cache_mode": cache_mode,
+        "benchmark_name": benchmark_name,
+        "warmup_runs": max(0, int(warmup_runs)) if cache_mode == "warm" else 0,
+        "sample_strategy": "fixed",
+        **cache_drop_stats,
         "locality_metrics": _aggregate_locality_metrics(locality_metric_rows),
     }
 
@@ -171,6 +227,14 @@ def print_section(title: str):
 def print_benchmark_result(name: str, stats: dict):
     print(name)
     print(f"  queries: {stats['queries']}")
+    print(f"  cache_mode: {stats['cache_mode']}")
+    print(f"  benchmark_name: {stats['benchmark_name']}")
+    print(f"  warmup_runs: {stats['warmup_runs']}")
+    print(f"  sample_strategy: {stats['sample_strategy']}")
+    print(f"  cache_drop_supported: {stats['cache_drop_supported']}")
+    print(f"  cache_drop_success: {stats['cache_drop_success']}")
+    if stats.get("cache_drop_error"):
+        print(f"  cache_drop_error: {stats['cache_drop_error']}")
     print(f"  avg_time_ms: {stats['avg_time_ms']:.3f}")
     print(f"  p50_time_ms: {stats['p50_time_ms']:.3f}")
     print(f"  p95_time_ms: {stats['p95_time_ms']:.3f}")
