@@ -33,6 +33,14 @@ from experiments.lancedb_graph.utils.adjacency_stats import build_adjacency_stat
 ADJ_INDEX_TABLE_NAME = "adj_index"
 
 
+def _normalize_table_names(list_tables_result):
+    if hasattr(list_tables_result, "tables"):
+        return set(getattr(list_tables_result, "tables") or [])
+    return {
+        item[0] if isinstance(item, (list, tuple)) else item for item in list_tables_result
+    }
+
+
 class LanceDBGraphAdjacency:
     """阶段二的邻接索引图存储实现。
 
@@ -113,11 +121,11 @@ class LanceDBGraphAdjacency:
         adj_index_df = adj_index_df.drop(columns=["out_neighbor_node_ids", "in_neighbor_node_ids"])
 
         if OVERWRITE_TABLES:
-            # `list_tables()` 在当前 LanceDB 版本中返回的元素可能不是纯字符串，
-            # 有些环境下会返回形如 `[name, ...]` 的结构，因此这里显式抽取表名。
-            existing_tables = {
-                item[0] if isinstance(item, (list, tuple)) else item for item in self.db.list_tables()
-            }
+            # `list_tables()` 在不同 LanceDB 版本中可能返回：
+            # 1. 纯字符串列表
+            # 2. `[name, ...]` 元组列表
+            # 3. 带 `.tables` 属性的响应对象
+            existing_tables = _normalize_table_names(self.db.list_tables())
             for table_name in [self.nodes_table_name, self.edges_table_name, self.adj_index_table_name]:
                 if table_name in existing_tables:
                     self.db.drop_table(table_name)
@@ -132,9 +140,7 @@ class LanceDBGraphAdjacency:
 
         显式检查三张表是否存在，避免在 benchmark 或实验脚本中静默失败。
         """
-        table_names = {
-            item[0] if isinstance(item, (list, tuple)) else item for item in self.db.list_tables()
-        }
+        table_names = _normalize_table_names(self.db.list_tables())
         if self.nodes_table_name not in table_names:
             raise ValueError(f"节点表不存在: {self.nodes_table_name}")
         if self.edges_table_name not in table_names:
