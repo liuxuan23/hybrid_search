@@ -13,3 +13,11 @@
 - 数据导入脚本
 - 一致性校验
 - 统一结果汇总
+
+当前已具备：
+
+- `LanceDB` adapter
+- `PostgreSQL` adapter
+- `ArangoDB` adapter
+- `import_postgres.py`
+- `import_arangodb.py`

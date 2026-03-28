@@ -5,6 +5,7 @@ from dataclasses import asdict
 from datetime import datetime
 
 from experiments.cross_db_graph import config
+from experiments.cross_db_graph.adapters.arangodb_adapter import ArangoDBGraphAdapter
 from experiments.cross_db_graph.adapters.lancedb_adapter import LanceDBGraphAdapter
 from experiments.cross_db_graph.adapters.postgres_adapter import PostgresGraphAdapter
 from experiments.cross_db_graph.result_schema import BenchmarkResult
@@ -30,11 +31,22 @@ def build_postgres_adapter():
     return PostgresGraphAdapter(dsn=config.POSTGRES_DSN)
 
 
+def build_arangodb_adapter():
+    return ArangoDBGraphAdapter(
+        url=config.ARANGODB_URL,
+        db_name=config.ARANGODB_DB,
+        username=config.ARANGODB_USERNAME,
+        password=config.ARANGODB_PASSWORD,
+    )
+
+
 def build_adapter(engine: str):
     if engine == "lancedb":
         return build_lancedb_adapter()
     if engine == "postgres":
         return build_postgres_adapter()
+    if engine == "arangodb":
+        return build_arangodb_adapter()
     raise ValueError(f"Unsupported engine: {engine}")
 
 
@@ -122,7 +134,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run cross-db graph benchmark")
     parser.add_argument(
         "--engine",
-        choices=["lancedb", "postgres"],
+        choices=["lancedb", "postgres", "arangodb"],
         default="lancedb",
         help="Which backend engine to benchmark",
     )

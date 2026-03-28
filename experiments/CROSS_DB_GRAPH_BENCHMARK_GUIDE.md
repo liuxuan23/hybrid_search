@@ -163,11 +163,12 @@ $$
 当前已实现：
 
 - `LanceDBGraphAdapter`
+- `PostgresGraphAdapter`
+- `ArangoDBGraphAdapter`
 
 尚未实现：
 
-- `PostgresGraphAdapter`
-- `ArangoDBGraphAdapter`
+- 查询结果一致性校验
 
 ### 第六步：查看结果
 
@@ -249,13 +250,84 @@ $$
 
 后续完整对比还需要继续补齐：
 
-1. `PostgreSQL` adapter
-2. `ArangoDB` adapter
-3. 数据导入脚本
-4. 查询结果一致性校验
-5. 统一汇总分析脚本
+1. 查询结果一致性校验
+2. 统一汇总分析脚本
+3. 更完善的 ArangoDB 部署与初始化脚本
 
-## 9. 当前建议
+## 9. ArangoDB 当前接入方式
+
+当前已新增：
+
+- `experiments/cross_db_graph/scripts/import_arangodb.py`
+- `experiments/cross_db_graph/adapters/arangodb_adapter.py`
+- `runner.py --engine arangodb`
+
+默认配置位于 `experiments/cross_db_graph/config.py`：
+
+- `ARANGODB_URL`
+- `ARANGODB_DB`
+- `ARANGODB_USERNAME`
+- `ARANGODB_PASSWORD`
+
+### ArangoDB 导入流程
+
+在本地启动 ArangoDB 后，可执行：
+
+- 导入 TSV 到 ArangoDB：
+  - `python experiments/cross_db_graph/scripts/import_arangodb.py <tsv_path>`
+
+该脚本会：
+
+1. 连接 `_system` 数据库并确保目标数据库存在
+2. 创建：
+  - 顶点集合 `graph_nodes`
+  - 边集合 `graph_edges`
+  - 图 `graph_bench_graph`
+3. 创建基础索引：
+  - `graph_nodes(node_id)` 唯一 hash index
+  - `graph_nodes(node_type)`
+  - `graph_nodes(community_id)`
+  - `graph_nodes(degree_out)` persistent index
+  - `graph_edges(src_id)`
+  - `graph_edges(dst_id)`
+4. 清空旧数据并批量导入节点与边
+
+### ArangoDB benchmark 运行方式
+
+导入完成后，可直接运行：
+
+- `python experiments/cross_db_graph/runner.py --engine arangodb`
+
+该 adapter 当前支持：
+
+- `1-hop` 邻居查询
+- `k-hop` 遍历查询
+- `batch 1-hop` 查询
+
+### 当前三库实验结果概览
+
+基于当前已跑通的结果目录：
+
+- `LanceDB`：`experiments/cross_db_graph/results/20260327_173441/summary.md`
+- `PostgreSQL`：`experiments/cross_db_graph/results/20260327_185547/summary.md`
+- `ArangoDB`：`experiments/cross_db_graph/results/20260328_160550/summary.md`
+
+当前平均耗时对比如下：
+
+| engine | neighbor mean ms | k_hop mean ms | batch_neighbor mean ms |
+| --- | ---: | ---: | ---: |
+| LanceDB | 43.150 | 94.660 | 1287.732 |
+| PostgreSQL | 0.977 | 4.988 | 2.611 |
+| ArangoDB | 2.342 | 2.365 | 2.241 |
+
+初步观察：
+
+- `LanceDB` 当前图查询实现明显最慢，尤其 `batch_neighbor` 开销很高
+- `PostgreSQL` 在 `neighbor` 上非常快，但 `3-hop` 查询会随着结果集扩大而明显变慢
+- `ArangoDB` 当前整体最稳定，`neighbor`、`k_hop`、`batch_neighbor` 都维持在约 `2~3 ms`
+- 但当前 `ArangoDB` 结果中的 `mean_result_count` 明显偏小，后续仍需要补做查询结果一致性校验，确认三库是否完全执行了同口径查询
+
+## 10. 当前建议
 
 建议后续按以下顺序推进：
 

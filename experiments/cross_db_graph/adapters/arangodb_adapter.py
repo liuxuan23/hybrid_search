@@ -1,4 +1,11 @@
+import time
+
+from arango import ArangoClient
+
 from experiments.cross_db_graph.adapters.base import GraphAdapter
+
+VERTEX_COLLECTION = "graph_nodes"
+EDGE_COLLECTION = "graph_edges"
 
 
 class ArangoDBGraphAdapter(GraphAdapter):
@@ -9,19 +16,58 @@ class ArangoDBGraphAdapter(GraphAdapter):
         self.db_name = db_name
         self.username = username
         self.password = password
+        self.client = None
         self.db = None
 
     def connect(self):
-        raise NotImplementedError("TODO: connect to ArangoDB")
+        self.client = ArangoClient(hosts=self.url)
+        self.db = self.client.db(self.db_name, username=self.username, password=self.password)
+        self.db.collections()
+        return self
 
     def close(self):
         self.db = None
+        self.client = None
 
     def query_neighbors(self, seed: str, direction: str = "out"):
-        raise NotImplementedError("TODO: implement AQL 1-hop query")
+        edge_field = "src_id" if direction == "out" else "dst_id"
+        target_field = "dst_id" if direction == "out" else "src_id"
+        query = f"""
+        FOR e IN {EDGE_COLLECTION}
+            FILTER e.{edge_field} == @seed
+            RETURN e.{target_field}
+        """
+        start = time.perf_counter()
+        cursor = self.db.aql.execute(query, bind_vars={"seed": seed})
+        rows = list(cursor)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return {"time_ms": elapsed_ms, "count": len(rows)}
 
     def query_k_hop(self, seed: str, k: int, direction: str = "out"):
-        raise NotImplementedError("TODO: implement AQL k-hop traversal")
+        traversal_direction = "OUTBOUND" if direction == "out" else "INBOUND"
+        start_vertex = f"{VERTEX_COLLECTION}/{seed}"
+        query = f"""
+        FOR v, e, p IN 1..@k {traversal_direction} @start_vertex {EDGE_COLLECTION}
+            OPTIONS {{ uniqueVertices: 'path' }}
+            COLLECT node_id = v.node_id
+            RETURN node_id
+        """
+        start = time.perf_counter()
+        cursor = self.db.aql.execute(query, bind_vars={"k": k, "start_vertex": start_vertex})
+        rows = list(cursor)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return {"time_ms": elapsed_ms, "count": len(rows)}
 
     def query_batch_neighbors(self, seeds, direction: str = "out"):
-        raise NotImplementedError("TODO: implement batch AQL neighbor query")
+        edge_field = "src_id" if direction == "out" else "dst_id"
+        target_field = "dst_id" if direction == "out" else "src_id"
+        query = f"""
+        FOR e IN {EDGE_COLLECTION}
+            FILTER e.{edge_field} IN @seeds
+            RETURN e.{target_field}
+        """
+        start = time.perf_counter()
+        cursor = self.db.aql.execute(query, bind_vars={"seeds": list(seeds)})
+        rows = list(cursor)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        return {"time_ms": elapsed_ms, "count": len(rows)}
