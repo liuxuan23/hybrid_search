@@ -92,7 +92,7 @@ def _import_in_batches(collection, docs, batch_size: int = 5000):
     for start in range(0, len(docs), batch_size):
         chunk = docs[start : start + batch_size]
         if chunk:
-            collection.import_bulk(chunk, overwrite=True)
+            collection.import_bulk(chunk, on_duplicate="replace")
 
 
 def import_tsv_to_arangodb(tsv_path: Path, url: str, db_name: str, username: str, password: str):

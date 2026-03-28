@@ -1,9 +1,37 @@
 import time
 
 
+_GRAPH_OWNER_BY_TABLE_ID = {}
+
+
+def register_graph_owner(adj_index_tbl, graph_owner):
+    _GRAPH_OWNER_BY_TABLE_ID[id(adj_index_tbl)] = graph_owner
+
+
+def _get_cached_row_by_node_id(adj_index_tbl, node_id: str):
+    graph = _GRAPH_OWNER_BY_TABLE_ID.get(id(adj_index_tbl)) or getattr(adj_index_tbl, "_graph_owner", None)
+    if graph is None:
+        return None
+    cache = getattr(graph, "node_id_to_physical_row_id", None)
+    if cache is None:
+        return None
+    physical_row_id = cache.get(node_id)
+    if physical_row_id is None:
+        return None
+    return _get_row_by_physical_row_id(adj_index_tbl, int(physical_row_id))
+
+
 def get_adj_entry(adj_index_tbl, node_id: str):
     """获取某个节点在 `adj_index` 中的索引项。"""
     start = time.time()
+    cached_row = _get_cached_row_by_node_id(adj_index_tbl, node_id)
+    if cached_row is not None:
+        return {
+            "rows": [cached_row],
+            "count": 1,
+            "time_ms": (time.time() - start) * 1000,
+        }
+
     df = adj_index_tbl.search().where(f"node_id = '{node_id}'").to_pandas()
     rows = df.to_dict("records") if not df.empty else []
     return {
@@ -155,6 +183,15 @@ def _take_rows_with_row_id(adj_index_tbl, row_ids):
     # 将待读取的row_id列表做规范化、去重、排序，确保 `take` 的输入符合预期。
     arrow_tbl = lance_ds.take(sorted(set(int(row_id) for row_id in row_ids)))
     return arrow_tbl.to_pandas()
+
+
+def _get_row_by_physical_row_id(adj_index_tbl, row_id: int):
+    df = _take_rows_with_row_id(adj_index_tbl, [int(row_id)])
+    if df.empty:
+        return None
+    row = df.to_dict("records")[0]
+    row["physical_row_id"] = int(row_id)
+    return row
 
 
 def _build_row_id_filter(row_ids):

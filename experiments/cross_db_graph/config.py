@@ -11,7 +11,7 @@ EDGES_FILE = BASE_DIR / "edges.jsonl"
 LANCEDB_DB_PATH = Path(
 	os.environ.get(
 		"LANCEDB_DB_PATH",
-		str(BASE_DIR.parent.parent / "storage" / "lancedb_graph" / "phase2_test_validation"),
+		str(BASE_DIR.parent.parent / "storage" / "lancedb_graph" / "cross_db_graph_benchmark"),
 	)
 )
 

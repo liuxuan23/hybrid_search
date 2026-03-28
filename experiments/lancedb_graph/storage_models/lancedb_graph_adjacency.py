@@ -22,6 +22,7 @@ from experiments.lancedb_graph.query_engines.basic_queries import (
     query_out_neighbors,
 )
 from experiments.lancedb_graph.query_engines.adjacency_queries import (
+    register_graph_owner,
     query_in_neighbors_index,
     query_neighbors_index,
     query_out_neighbors_index,
@@ -72,6 +73,7 @@ class LanceDBGraphAdjacency:
         self.nodes_tbl = None
         self.edges_tbl = None
         self.adj_index_tbl = None
+        self.node_id_to_physical_row_id = None
 
     def build_from_tsv(self, tsv_path: str, cluster_strategy: str = "by_node_type"):
         """从 TSV 构建 `nodes`、`edges` 和 `adj_index`。
@@ -151,6 +153,9 @@ class LanceDBGraphAdjacency:
         self.nodes_tbl = self.db[self.nodes_table_name]
         self.edges_tbl = self.db[self.edges_table_name]
         self.adj_index_tbl = self.db[self.adj_index_table_name]
+        self._attach_graph_owner(self.adj_index_tbl)
+        register_graph_owner(self.adj_index_tbl, self)
+        self._build_adj_index_caches()
         return self
 
     def stats(self):
@@ -262,6 +267,26 @@ class LanceDBGraphAdjacency:
         """确保三张核心表已加载。"""
         if self.nodes_tbl is None or self.edges_tbl is None or self.adj_index_tbl is None:
             self.load()
+
+    def _build_adj_index_caches(self):
+        """预加载 `node_id -> physical_row_id` 映射，不缓存整行内容。"""
+        if self.adj_index_tbl is None:
+            self.node_id_to_physical_row_id = None
+            return
+
+        df = self.adj_index_tbl.to_lance().to_table(columns=["node_id", "physical_row_id"]).to_pandas()
+        self.node_id_to_physical_row_id = {
+            row["node_id"]: int(row["physical_row_id"])
+            for row in df.to_dict("records")
+            if row.get("node_id") is not None and row.get("physical_row_id") is not None
+        }
+
+    def _attach_graph_owner(self, table):
+        """为 table 挂载 graph owner，失败时静默跳过。"""
+        try:
+            setattr(table, "_graph_owner", self)
+        except Exception:
+            pass
 
     def _write_dataframe_in_batches(self, table_name: str, df):
         """按批量写入 LanceDB。

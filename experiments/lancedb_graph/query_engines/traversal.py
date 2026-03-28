@@ -2,6 +2,7 @@ import time
 
 from experiments.lancedb_graph.query_engines.adjacency_queries import (
     _build_io_stats,
+    _get_cached_row_by_node_id,
     _read_process_io_bytes,
     _take_rows_with_row_id,
 )
@@ -131,6 +132,10 @@ def query_k_hop_index(
 
 def _get_row_by_node_id(adj_index_tbl, node_id: str):
     """按 node_id 读取单个邻接索引行。"""
+    cached_row = _get_cached_row_by_node_id(adj_index_tbl, node_id)
+    if cached_row is not None:
+        return cached_row
+
     df = adj_index_tbl.search().where(f"node_id = '{node_id}'").to_pandas()
     if df.empty:
         return None

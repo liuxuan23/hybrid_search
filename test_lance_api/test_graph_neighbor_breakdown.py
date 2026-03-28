@@ -6,10 +6,10 @@ from __future__ import annotations
 import statistics
 import time
 
-from experiments.cross_db_graph import config
 from experiments.lancedb_graph.storage_models.lancedb_graph_adjacency import LanceDBGraphAdjacency
 from experiments.lancedb_graph.query_engines import adjacency_queries as aq
 
+DB_PATH = "/home/liuxuan/workplace/hybrid_search/storage/lancedb_graph/cross_db_graph_benchmark"
 REPEATS = 20
 WARMUP = 5
 SEED = "type386:node_33386"
@@ -36,7 +36,7 @@ def _stats(values):
 
 
 def run_breakdown(seed: str = SEED):
-    graph = LanceDBGraphAdjacency(db_path=str(config.LANCEDB_DB_PATH)).load()
+    graph = LanceDBGraphAdjacency(db_path=DB_PATH).load()
     adj_tbl = graph.adj_index_tbl
 
     def entry_only():

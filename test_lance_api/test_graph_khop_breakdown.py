@@ -6,10 +6,10 @@ from __future__ import annotations
 import statistics
 import time
 
-from experiments.cross_db_graph import config
 from experiments.lancedb_graph.query_engines import traversal as tr
 from experiments.lancedb_graph.storage_models.lancedb_graph_adjacency import LanceDBGraphAdjacency
 
+DB_PATH = "/home/liuxuan/workplace/hybrid_search/storage/lancedb_graph/cross_db_graph_benchmark"
 REPEATS = 10
 WARMUP = 3
 SEED = "type386:node_33386"
@@ -192,7 +192,7 @@ def _run_khop_once(adj_tbl, seed: str, k: int, direction: str):
 
 
 def run_khop_breakdown(seed: str = SEED, k: int = K, direction: str = DIRECTION):
-    graph = LanceDBGraphAdjacency(db_path=str(config.LANCEDB_DB_PATH)).load()
+    graph = LanceDBGraphAdjacency(db_path=DB_PATH).load()
     adj_tbl = graph.adj_index_tbl
 
     single_run = _run_khop_once(adj_tbl, seed, k, direction)

@@ -382,6 +382,141 @@ experiments/lancedb_graph/
 - 先不引入高级 frontier 合并优化
 
 
+### 步骤六补充：已验证的阶段二优化边界
+
+在阶段二后续实现与 benchmark 中，已经明确一条必须遵守的优化边界：
+
+- 允许缓存 `node_id -> physical_row_id`
+- 不允许缓存整张 `adj_index` 的完整行内容
+- 不允许将 `physical_row_id -> row` 全量预加载到 Python 内存后直接完成邻居与多跳查询
+
+原因是阶段二的目标是验证 **“索引驱动 + Lance materialization”** 的真实执行路径，而不是把 `adj_index` 退化成一个进程内图缓存。
+
+也就是说：
+
+1. 查询入口可以通过内存映射快速把 `node_id` 定位到 `physical_row_id`
+2. 但索引项本身仍需要通过 Lance `take(row_id)` 或等价路径读取
+3. 邻居列表对应的后续行 materialize，仍应通过 Lance 批量 `take(row_ids)` 完成
+4. `k-hop` 扩展中每层 frontier 的行展开，也仍应走 Lance 存储访问路径
+
+该约束是阶段二 benchmark 可解释性的核心前提。
+
+
+## 7.1 当前已落地的优化逻辑说明
+
+结合当前 `storage_models/lancedb_graph_adjacency.py`、`query_engines/adjacency_queries.py` 与 `query_engines/traversal.py` 的实现，阶段二实际采用的优化逻辑如下。
+
+### 7.1.1 加载阶段：仅构建轻量映射
+
+在 `LanceDBGraphAdjacency.load()` 中：
+
+- 打开并加载 `adj_index`
+- 仅读取 `node_id` 与 `physical_row_id` 两列
+- 构建 `node_id_to_physical_row_id` 字典
+
+这一过程的目标，是把原本代价较高的：
+
+- `search().where(node_id = ...)`
+
+替换为常数时间的 Python 映射查找。
+
+但这里不会把如下内容整体缓存到内存：
+
+- `out_neighbor_row_ids`
+- `in_neighbor_row_ids`
+- `degree_out`
+- `degree_in`
+- 其他完整索引行字段
+
+因此，加载后的对象仍然是一个“Lance 为主、内存映射为辅”的执行模型。
+
+
+### 7.1.2 单跳查询路径
+
+当前单跳查询的推荐执行路径为：
+
+1. 用 `node_id_to_physical_row_id[node_id]` 找到入口 `row_id`
+2. 用 Lance `take([row_id])` 取回该节点在 `adj_index` 中的索引行
+3. 从该索引行中读取 `out_neighbor_row_ids` / `in_neighbor_row_ids`
+4. 如需 materialize 邻居详情，再对邻居 `row_ids` 执行 Lance 批量 `take`
+
+这样做的收益是：
+
+- 避开最慢的 `node_id` 条件查找
+- 保留真实的 Lance 行读取成本
+- benchmark 结果仍然可以代表存储系统实际查询路径
+
+
+### 7.1.3 多跳查询路径
+
+`query_k_hop_index()` 当前遵循以下原则：
+
+- 起点定位：使用 `node_id -> physical_row_id` 缓存映射
+- frontier 展开：使用每个索引行中的邻接 `row_ids`
+- 每一批 frontier materialize：通过 Lance `take(row_ids)` 读取
+- 去重与防回环：在 Python 层维护 `visited`
+
+也就是说，多跳优化的重点是减少“入口节点查找”的重复代价，而不是绕过 Lance 本身的行 materialization。
+
+
+### 7.1.4 明确禁止的做法
+
+以下做法已被验证会破坏阶段二 benchmark 语义，因此不应作为正式方案写入实现：
+
+- 启动时扫描整张 `adj_index` 并缓存为 `node_id -> full_row`
+- 启动时扫描整张 `adj_index` 并缓存为 `physical_row_id -> full_row`
+- 单跳查询完全通过 Python dict 返回邻接行
+- `k-hop` 扩展完全通过 Python 内存对象完成，不再经过 Lance `take`
+
+这类方式虽然会把查询时间大幅压低，但测到的已经不是 LanceDB 图查询性能，而是“预热后的 Python 内存图查询性能”。
+
+
+## 7.2 当前 profiling 结论与 benchmark 解释
+
+围绕阶段二实现，已经得到以下稳定结论。
+
+### 7.2.1 主要瓶颈判断
+
+在当前数据与实现下：
+
+- `search(node_id)` 明显慢于 `take(row_id)`
+- `node_id -> row_id` 映射查找几乎可以忽略不计
+- 单跳与多跳的主要剩余开销，集中在：
+    - Lance `take()`
+    - Arrow / pandas 转换
+    - Python 记录展开与结果组织
+
+因此，阶段二接受的优化重点应当是：
+
+- 用轻量映射移除入口查找瓶颈
+- 继续真实衡量 Lance materialization 成本
+
+
+### 7.2.2 已验证的测试现象
+
+当前 profiling 中，已经观察到如下典型现象：
+
+- `map_lookup_only_ms` 约为微秒级，可视为接近 0
+- `take_seed_only_ms` 明显低于 `search_seed_only_ms`
+- `take_neighbors_arrow_ms` 仍有可见成本
+- `full_neighbor_query_ms` 与 `graph_neighbor_breakdown` 的结果量级一致
+- `k-hop` 的主要耗时集中在批量 `take` 与结果 materialize
+
+这说明“只缓存 `node_id -> row_id`”确实有效，但不会把查询伪装成纯内存操作。
+
+
+### 7.2.3 benchmark 结果解释原则
+
+如果后续 benchmark 中出现两类结果：
+
+- 一类结果接近 `take()` 成本量级
+- 一类结果远低于已测 `take()` 成本
+
+那么通常应优先怀疑后者已经引入了“全量行缓存”或其他绕开 Lance materialization 的路径。
+
+阶段二正式结果应以“保留 Lance `take` 路径”的实现为准。
+
+
 ### 步骤七：建立阶段二 benchmark
 
 实现以下 benchmark：
