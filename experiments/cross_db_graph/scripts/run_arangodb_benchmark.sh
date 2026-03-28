@@ -10,6 +10,38 @@ DEFAULT_ARANGODB_DB="graph_bench"
 DEFAULT_ARANGODB_USERNAME="root"
 DEFAULT_ARANGODB_PASSWORD="123456"
 
+cleanup() {
+  echo "[cleanup] Dropping ArangoDB benchmark collections and graph ..."
+  ARANGODB_URL="$ARANGODB_URL" \
+  ARANGODB_DB="$ARANGODB_DB" \
+  ARANGODB_USERNAME="$ARANGODB_USERNAME" \
+  ARANGODB_PASSWORD="$ARANGODB_PASSWORD" \
+  "$PYTHON_BIN" - <<'PY'
+import os
+
+from arango import ArangoClient
+
+db_name = os.environ["ARANGODB_DB"]
+url = os.environ["ARANGODB_URL"]
+username = os.environ["ARANGODB_USERNAME"]
+password = os.environ["ARANGODB_PASSWORD"]
+
+client = ArangoClient(hosts=url)
+db = client.db(db_name, username=username, password=password)
+
+if db.has_graph("graph_bench_graph"):
+	db.delete_graph("graph_bench_graph", drop_collections=False, ignore_missing=True)
+
+if db.has_collection("graph_edges"):
+	db.delete_collection("graph_edges", ignore_missing=True)
+
+if db.has_collection("graph_nodes"):
+	db.delete_collection("graph_nodes", ignore_missing=True)
+
+print("Dropped ArangoDB graph/collections: graph_bench_graph, graph_edges, graph_nodes")
+PY
+}
+
 cd "$ROOT_DIR"
 
 TSV_PATH="${1:-$DEFAULT_TSV_PATH}"
@@ -17,6 +49,8 @@ ARANGODB_URL="${2:-$DEFAULT_ARANGODB_URL}"
 ARANGODB_DB="${3:-$DEFAULT_ARANGODB_DB}"
 ARANGODB_USERNAME="${4:-$DEFAULT_ARANGODB_USERNAME}"
 ARANGODB_PASSWORD="${5:-$DEFAULT_ARANGODB_PASSWORD}"
+
+trap cleanup EXIT
 
 echo "Running full ArangoDB benchmark pipeline ..."
 echo "  tsv_path           = $TSV_PATH"

@@ -7,10 +7,29 @@ PYTHON_BIN="/home/liuxuan/workplace/.venv/bin/python"
 DEFAULT_TSV_PATH="/data/dataset/graph_data/cluster/synthetic_community_100000.tsv"
 DEFAULT_POSTGRES_DSN="postgresql://postgres:postgres123@localhost:5432/graph_bench"
 
+cleanup() {
+    echo "[cleanup] Dropping PostgreSQL benchmark tables ..."
+    POSTGRES_DSN="$POSTGRES_DSN" "$PYTHON_BIN" - <<'PY'
+import os
+
+import psycopg
+
+dsn = os.environ["POSTGRES_DSN"]
+with psycopg.connect(dsn) as conn:
+    with conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS graph_edges")
+        cur.execute("DROP TABLE IF EXISTS graph_nodes")
+    conn.commit()
+print("Dropped PostgreSQL tables: graph_edges, graph_nodes")
+PY
+}
+
 cd "$ROOT_DIR"
 
 TSV_PATH="${1:-$DEFAULT_TSV_PATH}"
 POSTGRES_DSN="${2:-$DEFAULT_POSTGRES_DSN}"
+
+trap cleanup EXIT
 
 echo "Running full PostgreSQL benchmark pipeline ..."
 echo "  tsv_path       = $TSV_PATH"
