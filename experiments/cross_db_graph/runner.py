@@ -5,9 +5,6 @@ from dataclasses import asdict
 from datetime import datetime
 
 from experiments.cross_db_graph import config
-from experiments.cross_db_graph.adapters.arangodb_adapter import ArangoDBGraphAdapter
-from experiments.cross_db_graph.adapters.lancedb_adapter import LanceDBGraphAdapter
-from experiments.cross_db_graph.adapters.postgres_adapter import PostgresGraphAdapter
 from experiments.cross_db_graph.result_schema import BenchmarkResult
 from experiments.cross_db_graph.scripts.analyze_results import analyze_results
 from experiments.cross_db_graph.workloads import BatchNeighborQuery, KHopQuery, NeighborQuery, build_default_workloads
@@ -24,14 +21,26 @@ def load_seeds():
 
 
 def build_lancedb_adapter(materialize: bool = True):
+    from experiments.cross_db_graph.adapters.lancedb_adapter import LanceDBGraphAdapter
+
     return LanceDBGraphAdapter(db_path=str(config.LANCEDB_DB_PATH), materialize=materialize)
 
 
+def build_lance_graph_adapter(materialize: bool = False):
+    from experiments.cross_db_graph.adapters.lance_graph_adapter import LanceGraphAdapter
+
+    return LanceGraphAdapter(db_path=str(config.LANCEDB_DB_PATH), materialize=materialize)
+
+
 def build_postgres_adapter(materialize: bool = False):
+    from experiments.cross_db_graph.adapters.postgres_adapter import PostgresGraphAdapter
+
     return PostgresGraphAdapter(dsn=config.POSTGRES_DSN, materialize=materialize)
 
 
 def build_arangodb_adapter(materialize: bool = False):
+    from experiments.cross_db_graph.adapters.arangodb_adapter import ArangoDBGraphAdapter
+
     return ArangoDBGraphAdapter(
         url=config.ARANGODB_URL,
         db_name=config.ARANGODB_DB,
@@ -44,6 +53,8 @@ def build_arangodb_adapter(materialize: bool = False):
 def build_adapter(engine: str, materialize: bool | None = None):
     if engine == "lancedb":
         return build_lancedb_adapter(materialize=True if materialize is None else materialize)
+    if engine == "lance_graph":
+        return build_lance_graph_adapter(materialize=False if materialize is None else materialize)
     if engine == "postgres":
         return build_postgres_adapter(materialize=False if materialize is None else materialize)
     if engine == "arangodb":
@@ -135,7 +146,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run cross-db graph benchmark")
     parser.add_argument(
         "--engine",
-        choices=["lancedb", "postgres", "arangodb"],
+        choices=["lancedb", "lance_graph", "postgres", "arangodb"],
         default="lancedb",
         help="Which backend engine to benchmark",
     )

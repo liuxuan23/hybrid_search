@@ -17,7 +17,12 @@
 当前已具备：
 
 - `LanceDB` adapter
+- `lance_graph` adapter（phase 1）
 - `PostgreSQL` adapter
 - `ArangoDB` adapter
 - `import_postgres.py`
 - `import_arangodb.py`
+
+补充文档：
+
+- `LANCE_GRAPH_BENCHMARK_PLAN.md`：`lance_graph` 与 adjacency 路径的大图 benchmark 设计与分阶段实施计划

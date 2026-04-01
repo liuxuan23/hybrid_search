@@ -22,18 +22,45 @@ def load_results(csv_path: Path) -> List[dict]:
 def summarize_rows(rows: List[dict]) -> Dict[str, object]:
     by_type = defaultdict(list)
     khop_by_k = defaultdict(list)
+    by_batch_size = defaultdict(list)
+    seeds_by_type = defaultdict(set)
+    error_rows = []
 
     for row in rows:
         by_type[row["query_type"]].append(row)
         if row["query_type"] == "k_hop":
             khop_by_k[row["k"]].append(row)
+        if row["query_type"] == "batch_neighbor" and row["batch_size"]:
+            by_batch_size[row["batch_size"]].append(row)
+        if row.get("seed"):
+            seeds_by_type[row["query_type"]].add(row["seed"])
+        if not row["success"]:
+            error_rows.append(row)
+
+    tested_parameters = {
+        "engine": rows[0].get("engine", "") if rows else "",
+        "query_types": sorted(by_type.keys()),
+        "k_values": sorted(khop_by_k.keys()),
+        "batch_sizes": sorted(by_batch_size.keys()),
+        "seed_counts_by_query_type": {
+            query_type: len(seeds)
+            for query_type, seeds in sorted(seeds_by_type.items())
+        },
+    }
 
     summary = {
         "total_runs": len(rows),
         "success_runs": sum(1 for row in rows if row["success"]),
+        "tested_parameters": tested_parameters,
+        "run_profile": {
+            "unique_seeds": len({row["seed"] for row in rows if row.get("seed")}),
+            "query_type_count": len(by_type),
+        },
         "by_type": {},
         "khop_by_k": {},
+        "batch_by_size": {},
         "slowest_rows": sorted(rows, key=lambda x: x["time_ms"], reverse=True)[:10],
+        "error_rows": error_rows[:10],
     }
 
     for query_type, items in sorted(by_type.items()):
@@ -41,6 +68,7 @@ def summarize_rows(rows: List[dict]) -> Dict[str, object]:
         counts = [item["result_count"] for item in items]
         summary["by_type"][query_type] = {
             "runs": len(items),
+            "unique_seeds": len(seeds_by_type[query_type]),
             "mean_time_ms": mean(times),
             "median_time_ms": median(times),
             "min_time_ms": min(times),
@@ -64,6 +92,20 @@ def summarize_rows(rows: List[dict]) -> Dict[str, object]:
             "max_result_count": max(counts),
         }
 
+    for batch_size, items in sorted(by_batch_size.items()):
+        times = [item["time_ms"] for item in items]
+        counts = [item["result_count"] for item in items]
+        summary["batch_by_size"][batch_size] = {
+            "runs": len(items),
+            "mean_time_ms": mean(times),
+            "median_time_ms": median(times),
+            "min_time_ms": min(times),
+            "max_time_ms": max(times),
+            "mean_result_count": mean(counts),
+            "min_result_count": min(counts),
+            "max_result_count": max(counts),
+        }
+
     return summary
 
 
@@ -75,28 +117,77 @@ def render_summary(summary: Dict[str, object], csv_name: str) -> str:
     total_runs = summary["total_runs"]
     success_runs = summary["success_runs"]
     success_rate = (success_runs / total_runs * 100.0) if total_runs else 0.0
+    tested_parameters = summary["tested_parameters"]
 
     lines = [
         "# Cross-DB Graph Benchmark Summary",
         "",
-        "## Overall",
+        "## This Run",
         "",
-        f"- total runs: {total_runs}",
-        f"- success runs: {success_runs}",
-        f"- success rate: {_format_float(success_rate)}%",
+        f"- engine: `{tested_parameters.get('engine', '')}`",
+        f"- query types executed: {', '.join(f'`{q}`' for q in tested_parameters.get('query_types', [])) or 'none'}",
+        f"- k values tested: {', '.join(str(k) for k in tested_parameters.get('k_values', [])) or 'none'}",
+        f"- batch sizes tested: {', '.join(str(b) for b in tested_parameters.get('batch_sizes', [])) or 'none'}",
+        f"- unique seeds in this run: {summary['run_profile']['unique_seeds']}",
         f"- raw results: `{csv_name}`",
         "",
-        "## By Query Type",
+        "## Tested Workloads and Parameters",
         "",
-        "| query_type | runs | mean_time_ms | median_time_ms | min_time_ms | max_time_ms | mean_result_count | min_result_count | max_result_count |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| query_type | runs | unique_seeds | parameterization |",
+        "| --- | ---: | ---: | --- |",
     ]
 
     for query_type, stats in summary["by_type"].items():
+        parameterization = []
+        if query_type == "k_hop":
+            k_values = tested_parameters.get("k_values", [])
+            parameterization.append("k in [" + ", ".join(str(k) for k in k_values) + "]")
+        if query_type == "batch_neighbor":
+            batch_sizes = tested_parameters.get("batch_sizes", [])
+            parameterization.append(
+                "batch_size in [" + ", ".join(str(b) for b in batch_sizes) + "]"
+            )
+        if not parameterization:
+            parameterization.append("default parameters")
         lines.append(
-            "| {query_type} | {runs} | {mean_time} | {median_time} | {min_time} | {max_time} | {mean_count} | {min_count} | {max_count} |".format(
+            f"| {query_type} | {stats['runs']} | {stats['unique_seeds']} | {'; '.join(parameterization)} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Overall",
+            "",
+            f"- total runs: {total_runs}",
+            f"- success runs: {success_runs}",
+            f"- success rate: {_format_float(success_rate)}%",
+            "",
+            "## Seed Coverage",
+            "",
+            "| query_type | unique_seed_count |",
+            "| --- | ---: |",
+        ]
+    )
+
+    for query_type, seed_count in tested_parameters["seed_counts_by_query_type"].items():
+        lines.append(f"| {query_type} | {seed_count} |")
+
+    lines.extend(
+        [
+            "",
+            "## By Query Type",
+            "",
+            "| query_type | runs | unique_seeds | mean_time_ms | median_time_ms | min_time_ms | max_time_ms | mean_result_count | min_result_count | max_result_count |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
+
+    for query_type, stats in summary["by_type"].items():
+        lines.append(
+            "| {query_type} | {runs} | {unique_seeds} | {mean_time} | {median_time} | {min_time} | {max_time} | {mean_count} | {min_count} | {max_count} |".format(
                 query_type=query_type,
                 runs=stats["runs"],
+                unique_seeds=stats["unique_seeds"],
                 mean_time=_format_float(stats["mean_time_ms"]),
                 median_time=_format_float(stats["median_time_ms"]),
                 min_time=_format_float(stats["min_time_ms"]),
@@ -132,6 +223,32 @@ def render_summary(summary: Dict[str, object], csv_name: str) -> str:
             )
         )
 
+    if summary["batch_by_size"]:
+        lines.extend(
+            [
+                "",
+                "## Batch Size Breakdown",
+                "",
+                "| batch_size | runs | mean_time_ms | median_time_ms | min_time_ms | max_time_ms | mean_result_count | min_result_count | max_result_count |",
+                "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            ]
+        )
+
+        for batch_size, stats in summary["batch_by_size"].items():
+            lines.append(
+                "| {batch_size} | {runs} | {mean_time} | {median_time} | {min_time} | {max_time} | {mean_count} | {min_count} | {max_count} |".format(
+                    batch_size=batch_size,
+                    runs=stats["runs"],
+                    mean_time=_format_float(stats["mean_time_ms"]),
+                    median_time=_format_float(stats["median_time_ms"]),
+                    min_time=_format_float(stats["min_time_ms"]),
+                    max_time=_format_float(stats["max_time_ms"]),
+                    mean_count=_format_float(stats["mean_result_count"]),
+                    min_count=stats["min_result_count"],
+                    max_count=stats["max_result_count"],
+                )
+            )
+
     lines.extend(
         [
             "",
@@ -160,6 +277,24 @@ def render_summary(summary: Dict[str, object], csv_name: str) -> str:
             "- `batch_neighbor` indicates whether the current batch path is efficiently optimized.",
         ]
     )
+
+    if summary["error_rows"]:
+        lines.extend(
+            [
+                "",
+                "## Sample Errors",
+                "",
+                "| query_type | seed | k | batch_size | error_message |",
+                "| --- | --- | ---: | ---: | --- |",
+            ]
+        )
+        for row in summary["error_rows"]:
+            error_message = (row.get("error_message") or "").replace("\n", " ")
+            if len(error_message) > 120:
+                error_message = error_message[:117] + "..."
+            lines.append(
+                f"| {row['query_type']} | {row['seed']} | {row['k']} | {row['batch_size']} | {error_message} |"
+            )
 
     return "\n".join(lines) + "\n"
 

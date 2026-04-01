@@ -23,6 +23,7 @@ dependencies = [
     "psycopg[binary]>=3.2.0",
     "python-arango>=8.1.0",
     "pylance>=4.0.0",
+    "lance-graph",
 ]
 
 [dependency-groups]
@@ -63,3 +64,6 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W"]
 ignore = []
+
+[tool.uv.sources]
+lance-graph = { path = "../lance-graph/python", editable = true }

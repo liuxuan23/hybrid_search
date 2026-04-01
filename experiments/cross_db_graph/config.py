@@ -28,4 +28,4 @@ POSTGRES_DSN = os.environ.get(
 ARANGODB_URL = os.environ.get("ARANGODB_URL", "http://127.0.0.1:8529")
 ARANGODB_DB = os.environ.get("ARANGODB_DB", "graph_bench")
 ARANGODB_USERNAME = os.environ.get("ARANGODB_USERNAME", "root")
-ARANGODB_PASSWORD = os.environ.get("ARANGODB_PASSWORD", "123456")
+ARANGODB_PASSWORD = os.environ.get("ARANGODB_PASSWORD", "")

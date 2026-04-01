@@ -8,7 +8,7 @@ DEFAULT_TSV_PATH="/data/dataset/graph_data/cluster/synthetic_community_100000.ts
 DEFAULT_ARANGODB_URL="http://127.0.0.1:8529"
 DEFAULT_ARANGODB_DB="graph_bench"
 DEFAULT_ARANGODB_USERNAME="root"
-DEFAULT_ARANGODB_PASSWORD="123456"
+DEFAULT_ARANGODB_PASSWORD=""
 
 cleanup() {
   echo "[cleanup] Dropping ArangoDB benchmark collections and graph ..."
