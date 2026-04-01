@@ -23,30 +23,31 @@ def load_seeds():
     return single_seeds, batch_seeds
 
 
-def build_lancedb_adapter():
-    return LanceDBGraphAdapter(db_path=str(config.LANCEDB_DB_PATH))
+def build_lancedb_adapter(materialize: bool = True):
+    return LanceDBGraphAdapter(db_path=str(config.LANCEDB_DB_PATH), materialize=materialize)
 
 
-def build_postgres_adapter():
-    return PostgresGraphAdapter(dsn=config.POSTGRES_DSN)
+def build_postgres_adapter(materialize: bool = False):
+    return PostgresGraphAdapter(dsn=config.POSTGRES_DSN, materialize=materialize)
 
 
-def build_arangodb_adapter():
+def build_arangodb_adapter(materialize: bool = False):
     return ArangoDBGraphAdapter(
         url=config.ARANGODB_URL,
         db_name=config.ARANGODB_DB,
         username=config.ARANGODB_USERNAME,
         password=config.ARANGODB_PASSWORD,
+        materialize=materialize,
     )
 
 
-def build_adapter(engine: str):
+def build_adapter(engine: str, materialize: bool | None = None):
     if engine == "lancedb":
-        return build_lancedb_adapter()
+        return build_lancedb_adapter(materialize=True if materialize is None else materialize)
     if engine == "postgres":
-        return build_postgres_adapter()
+        return build_postgres_adapter(materialize=False if materialize is None else materialize)
     if engine == "arangodb":
-        return build_arangodb_adapter()
+        return build_arangodb_adapter(materialize=False if materialize is None else materialize)
     raise ValueError(f"Unsupported engine: {engine}")
 
 
@@ -138,6 +139,12 @@ def parse_args():
         default="lancedb",
         help="Which backend engine to benchmark",
     )
+    parser.add_argument(
+        "--materialize",
+        choices=["true", "false"],
+        default=None,
+        help="Override query materialization mode for the selected engine",
+    )
     return parser.parse_args()
 
 
@@ -146,7 +153,8 @@ def main():
     single_seeds, batch_seeds = load_seeds()
     workloads = build_default_workloads(single_seeds, batch_seeds)
     print(f"Loaded {len(workloads)} workloads from {config.SEEDS_FILE}")
-    adapter = build_adapter(args.engine)
+    materialize = None if args.materialize is None else args.materialize == "true"
+    adapter = build_adapter(args.engine, materialize=materialize)
     adapter.connect()
     try:
         results = execute_benchmark(adapter, workloads)
