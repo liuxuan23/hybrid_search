@@ -123,6 +123,103 @@ def query_neighbors_index(
     }
 
 
+def query_batch_neighbors_index(
+    adj_index_tbl,
+    node_ids,
+    direction: str = "out",
+    materialize: bool = False,
+):
+    """基于邻接索引批量查询多个节点的邻居。"""
+    if direction not in {"out", "in", "both"}:
+        raise ValueError(f"Unsupported direction: {direction}")
+
+    start = time.perf_counter()
+    io_before = _read_process_io_bytes()
+    normalized_node_ids = [str(node_id) for node_id in node_ids or []]
+    if not normalized_node_ids:
+        return {
+            "rows": [],
+            "count": 0,
+            "time_ms": (time.perf_counter() - start) * 1000,
+            "mode": "materialized" if materialize else "index-only",
+            "io_stats": _build_io_stats(io_before),
+        }
+
+    entries = _get_adj_entries_by_node_ids(adj_index_tbl, normalized_node_ids)
+    if not entries:
+        return {
+            "rows": [],
+            "count": 0,
+            "time_ms": (time.perf_counter() - start) * 1000,
+            "mode": "materialized" if materialize else "index-only",
+            "io_stats": _build_io_stats(io_before),
+        }
+
+    neighbor_row_ids_by_seed = {}
+    ordered_unique_neighbor_row_ids = []
+    seen_neighbor_row_ids = set()
+
+    for seed in normalized_node_ids:
+        entry = entries.get(seed)
+        if entry is None:
+            neighbor_row_ids_by_seed[seed] = []
+            continue
+
+        neighbor_row_ids = _get_directional_neighbor_row_ids(entry, direction)
+        deduped_neighbor_row_ids = []
+        local_seen = set()
+        for neighbor_row_id in neighbor_row_ids:
+            neighbor_row_id = int(neighbor_row_id)
+            if neighbor_row_id in local_seen:
+                continue
+            local_seen.add(neighbor_row_id)
+            deduped_neighbor_row_ids.append(neighbor_row_id)
+            if neighbor_row_id not in seen_neighbor_row_ids:
+                seen_neighbor_row_ids.add(neighbor_row_id)
+                ordered_unique_neighbor_row_ids.append(neighbor_row_id)
+
+        neighbor_row_ids_by_seed[seed] = deduped_neighbor_row_ids
+
+    materialized_rows_by_row_id = {}
+    if materialize and ordered_unique_neighbor_row_ids:
+        for row in _materialize_adj_rows(adj_index_tbl, ordered_unique_neighbor_row_ids):
+            physical_row_id = row.get("physical_row_id", row.get("row_id", row.get("_rowid")))
+            if physical_row_id is None:
+                continue
+            materialized_rows_by_row_id[int(physical_row_id)] = row
+
+    rows = []
+    total_count = 0
+    for seed in normalized_node_ids:
+        neighbor_row_ids = neighbor_row_ids_by_seed.get(seed, [])
+        total_count += len(neighbor_row_ids)
+
+        if materialize:
+            for neighbor_row_id in neighbor_row_ids:
+                row = materialized_rows_by_row_id.get(int(neighbor_row_id))
+                if row is None:
+                    continue
+                row_with_seed = dict(row)
+                row_with_seed["seed"] = seed
+                if direction == "both":
+                    row_with_seed["direction"] = _infer_neighbor_direction(entries.get(seed), int(neighbor_row_id))
+                rows.append(row_with_seed)
+        else:
+            for neighbor_row_id in neighbor_row_ids:
+                row = {"seed": seed, "row_id": int(neighbor_row_id)}
+                if direction == "both":
+                    row["direction"] = _infer_neighbor_direction(entries.get(seed), int(neighbor_row_id))
+                rows.append(row)
+
+    return {
+        "rows": rows,
+        "count": total_count,
+        "time_ms": (time.perf_counter() - start) * 1000,
+        "mode": "materialized" if materialize else "index-only",
+        "io_stats": _build_io_stats(io_before),
+    }
+
+
 def _materialize_adj_rows(adj_index_tbl, neighbor_row_ids):
     """根据 row_id 列表回表获取邻接索引行。
 
@@ -170,6 +267,33 @@ def _materialize_adj_rows(adj_index_tbl, neighbor_row_ids):
     return rows
 
 
+def _get_adj_entries_by_node_ids(adj_index_tbl, node_ids):
+    """按 node_id 批量读取邻接索引项。"""
+    entries = {}
+    missing_node_ids = []
+
+    for node_id in node_ids:
+        cached_row = _get_cached_row_by_node_id(adj_index_tbl, node_id)
+        if cached_row is not None:
+            entries[node_id] = cached_row
+        else:
+            missing_node_ids.append(node_id)
+
+    if not missing_node_ids:
+        return entries
+
+    condition = _build_string_in_filter("node_id", missing_node_ids)
+    df = adj_index_tbl.search().where(condition).to_pandas()
+    if df.empty:
+        return entries
+
+    for row in df.to_dict("records"):
+        row_node_id = row.get("node_id")
+        if row_node_id is not None:
+            entries[str(row_node_id)] = row
+    return entries
+
+
 def _fetch_rows_with_row_id(adj_index_tbl, row_id_expr: str):
     """基于 `_rowid` 过滤条件按需读取目标邻接行。"""
     lance_ds = adj_index_tbl.to_lance()
@@ -201,6 +325,67 @@ def _build_row_id_filter(row_ids):
         return f"_rowid = {unique_row_ids[0]}"
     joined = ", ".join(str(row_id) for row_id in unique_row_ids)
     return f"_rowid IN ({joined})"
+
+
+def _build_string_in_filter(column: str, values):
+    unique_values = []
+    seen = set()
+    for value in values:
+        normalized = str(value)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_values.append(normalized)
+
+    if not unique_values:
+        return "1 = 0"
+
+    escaped_values = ["'" + value.replace("'", "''") + "'" for value in unique_values]
+    if len(escaped_values) == 1:
+        return f"{column} = {escaped_values[0]}"
+    return f"{column} IN ({', '.join(escaped_values)})"
+
+
+def _get_directional_neighbor_row_ids(entry, direction: str):
+    if entry is None:
+        return []
+
+    out_row_ids = _normalize_row_id_list(entry.get("out_neighbor_row_ids"))
+    in_row_ids = _normalize_row_id_list(entry.get("in_neighbor_row_ids"))
+
+    if direction == "out":
+        return out_row_ids
+    if direction == "in":
+        return in_row_ids
+
+    merged = []
+    seen = set()
+    for row_id in out_row_ids + in_row_ids:
+        row_id = int(row_id)
+        if row_id in seen:
+            continue
+        seen.add(row_id)
+        merged.append(row_id)
+    return merged
+
+
+def _infer_neighbor_direction(entry, neighbor_row_id: int):
+    if entry is None:
+        return "unknown"
+
+    out_row_ids = {int(row_id) for row_id in _normalize_row_id_list(entry.get("out_neighbor_row_ids"))}
+    in_row_ids = {int(row_id) for row_id in _normalize_row_id_list(entry.get("in_neighbor_row_ids"))}
+
+    is_out = neighbor_row_id in out_row_ids
+    is_in = neighbor_row_id in in_row_ids
+
+    if is_out and is_in:
+        return "both"
+    if is_out:
+        return "out"
+    if is_in:
+        return "in"
+    return "unknown"
 
 
 def _normalize_row_id_list(value):

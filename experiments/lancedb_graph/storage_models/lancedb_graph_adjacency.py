@@ -23,6 +23,7 @@ from experiments.lancedb_graph.query_engines.basic_queries import (
 )
 from experiments.lancedb_graph.query_engines.adjacency_queries import (
     register_graph_owner,
+    query_batch_neighbors_index,
     query_in_neighbors_index,
     query_neighbors_index,
     query_out_neighbors_index,
@@ -208,6 +209,21 @@ class LanceDBGraphAdjacency:
         return query_neighbors_index(
             self.adj_index_tbl,
             node_id,
+            materialize=materialize,
+        )
+
+    def query_batch_neighbors_index(
+        self,
+        node_ids,
+        direction: str = "out",
+        materialize: bool = False,
+    ):
+        """基于邻接索引批量查询多个节点的邻居。"""
+        self._ensure_loaded()
+        return query_batch_neighbors_index(
+            self.adj_index_tbl,
+            node_ids=node_ids,
+            direction=direction,
             materialize=materialize,
         )
 

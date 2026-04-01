@@ -51,22 +51,14 @@ class LanceDBGraphAdapter(GraphAdapter):
 
     def query_batch_neighbors(self, seeds, direction: str = "out"):
         self._ensure_connected()
-        rows = []
-        total_time_ms = 0.0
-        total_count = 0
-
-        for seed in seeds:
-            result = self.query_neighbors(seed, direction=direction)
-            total_time_ms += result["time_ms"]
-            total_count += result["count"]
-            rows.append({"seed": seed, "count": result["count"], "time_ms": result["time_ms"]})
-
-        return {
-            "rows": rows,
-            "count": total_count,
-            "time_ms": total_time_ms,
-            "mode": "batch",
-        }
+        result = self.graph.query_batch_neighbors_index(
+            seeds,
+            direction=direction or self.direction,
+            materialize=self.materialize,
+        )
+        normalized = self._normalize_result(result)
+        normalized["mode"] = "batch"
+        return normalized
 
     def _ensure_connected(self):
         if not self.connected or self.graph is None:

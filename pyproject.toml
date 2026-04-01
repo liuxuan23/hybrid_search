@@ -22,6 +22,7 @@ dependencies = [
     "datasets>=2.0.0",
     "psycopg[binary]>=3.2.0",
     "python-arango>=8.1.0",
+    "pylance>=4.0.0",
 ]
 
 [dependency-groups]
