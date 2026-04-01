@@ -517,6 +517,39 @@ experiments/lancedb_graph/
 阶段二正式结果应以“保留 Lance `take` 路径”的实现为准。
 
 
+### 7.2.4 batch 邻居查询的额外优化计划
+
+在当前阶段二实现中，`batch_neighbor` 已经使用了 `node_id -> physical_row_id` 的轻量映射，
+因此不会再退回到逐个 `node_id` 条件过滤。
+
+但 profiling 表明，批量路径仍可能退化为：
+
+1. 先对每个 seed 做 `node_id -> physical_row_id` 映射查找
+2. 再对每个 seed 单独执行一次 `take([row_id])`
+
+这种做法虽然避开了最慢的 `search(node_id)`，但本质上仍然是“批量入口、串行取行”，
+会让 `batch_neighbor` 的主要耗时集中在 seed 索引项读取阶段。
+
+因此，阶段二应补充一条明确的 batch 优化策略：
+
+- 允许继续使用 `node_id -> physical_row_id` 轻量映射
+- 对于已命中缓存的多个 seed，应先收集全部 `physical_row_id`
+- 再通过一次 Lance `take(row_ids)` 批量读取这些 seed 的 `adj_index` 行
+- 最后在 Python 层按 `node_id` 或 `_rowid` 重建 seed -> entry 映射
+
+该优化仍然满足阶段二的语义边界：
+
+- 没有缓存整张 `adj_index` 完整行
+- 没有绕过 Lance materialization
+- 只是把“多次单行 `take`”收敛为“一次批量 `take`”
+
+预期收益主要体现在：
+
+- 显著降低 `batch_neighbor` 的 seed entry 读取成本
+- 保持单跳/多跳 benchmark 的可解释性
+- 为后续 frontier 级批量读取优化提供一致的实现模式
+
+
 ### 步骤七：建立阶段二 benchmark
 
 实现以下 benchmark：

@@ -271,13 +271,46 @@ def _get_adj_entries_by_node_ids(adj_index_tbl, node_ids):
     """按 node_id 批量读取邻接索引项。"""
     entries = {}
     missing_node_ids = []
+    cached_row_ids_by_node_id = {}
 
     for node_id in node_ids:
+        graph = _GRAPH_OWNER_BY_TABLE_ID.get(id(adj_index_tbl)) or getattr(adj_index_tbl, "_graph_owner", None)
+        cache = getattr(graph, "node_id_to_physical_row_id", None) if graph is not None else None
+        if cache is not None:
+            physical_row_id = cache.get(node_id)
+            if physical_row_id is not None:
+                cached_row_ids_by_node_id[node_id] = int(physical_row_id)
+                continue
+
         cached_row = _get_cached_row_by_node_id(adj_index_tbl, node_id)
         if cached_row is not None:
             entries[node_id] = cached_row
-        else:
-            missing_node_ids.append(node_id)
+            continue
+
+        missing_node_ids.append(node_id)
+
+    if cached_row_ids_by_node_id:
+        cached_rows_df = _take_rows_with_row_id(adj_index_tbl, list(cached_row_ids_by_node_id.values()))
+        row_by_physical_row_id = {}
+        if not cached_rows_df.empty:
+            cached_rows = cached_rows_df.to_dict("records")
+            if "_rowid" not in cached_rows_df.columns:
+                sorted_row_ids = sorted(set(cached_row_ids_by_node_id.values()))
+                for idx, row in enumerate(cached_rows):
+                    if idx < len(sorted_row_ids):
+                        row["_rowid"] = sorted_row_ids[idx]
+            row_by_physical_row_id = {
+                int(row["_rowid"]): row for row in cached_rows if row.get("_rowid") is not None
+            }
+
+        for node_id, physical_row_id in cached_row_ids_by_node_id.items():
+            row = row_by_physical_row_id.get(int(physical_row_id))
+            if row is not None:
+                materialized_row = dict(row)
+                materialized_row["physical_row_id"] = int(physical_row_id)
+                entries[node_id] = materialized_row
+            else:
+                missing_node_ids.append(node_id)
 
     if not missing_node_ids:
         return entries
