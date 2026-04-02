@@ -1,10 +1,15 @@
 import argparse
+import json
 from pathlib import Path
 
 import psycopg
 
 from experiments.cross_db_graph import config
-from experiments.lancedb_graph.data_prep.build_graph_tables import build_graph_dataframes_from_tsv
+from experiments.lancedb_graph.data_prep.build_graph_tables import (
+    batched,
+    build_node_records_from_tsv,
+    iter_edge_records_from_tsv,
+)
 
 
 def ensure_schema(conn):
@@ -48,48 +53,51 @@ def truncate_tables(conn):
 
 
 def import_tsv_to_postgres(tsv_path: Path, dsn: str):
-    nodes_df, edges_df = build_graph_dataframes_from_tsv(str(tsv_path))
+    node_records = build_node_records_from_tsv(str(tsv_path))
 
     with psycopg.connect(dsn) as conn:
         ensure_schema(conn)
         truncate_tables(conn)
 
         with conn.cursor() as cur:
-            cur.executemany(
-                """
-                INSERT INTO graph_nodes (node_id, node_type, degree_out, degree_in, community_id, attrs_json)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb)
-                """,
-                [
-                    (
-                        row.node_id,
-                        row.node_type,
-                        int(row.degree_out),
-                        int(row.degree_in),
-                        row.community_id,
-                        row.attrs_json,
-                    )
-                    for row in nodes_df.itertuples(index=False)
-                ],
-            )
-            cur.executemany(
-                """
-                INSERT INTO graph_edges (edge_id, src_id, dst_id, edge_type, src_type, dst_type, attrs_json)
-                VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
-                """,
-                [
-                    (
-                        row.edge_id,
-                        row.src_id,
-                        row.dst_id,
-                        row.edge_type,
-                        row.src_type,
-                        row.dst_type,
-                        row.attrs_json,
-                    )
-                    for row in edges_df.itertuples(index=False)
-                ],
-            )
+            for chunk in batched(node_records, batch_size=10_000):
+                cur.executemany(
+                    """
+                    INSERT INTO graph_nodes (node_id, node_type, degree_out, degree_in, community_id, attrs_json)
+                    VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    [
+                        (
+                            row.node_id,
+                            row.node_type,
+                            int(row.degree_out),
+                            int(row.degree_in),
+                            row.community_id,
+                            row.attrs_json,
+                        )
+                        for row in chunk
+                    ],
+                )
+
+            for chunk in batched(iter_edge_records_from_tsv(str(tsv_path)), batch_size=10_000):
+                cur.executemany(
+                    """
+                    INSERT INTO graph_edges (edge_id, src_id, dst_id, edge_type, src_type, dst_type, attrs_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+                    """,
+                    [
+                        (
+                            row.edge_id,
+                            row.src_id,
+                            row.dst_id,
+                            row.edge_type,
+                            row.src_type,
+                            row.dst_type,
+                            row.attrs_json,
+                        )
+                        for row in chunk
+                    ],
+                )
         conn.commit()
 
 

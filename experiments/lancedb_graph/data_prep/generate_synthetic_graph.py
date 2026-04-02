@@ -3,6 +3,9 @@ import csv
 import json
 import os
 import random
+from collections import Counter
+from array import array
+from typing import List, Tuple
 
 from experiments.lancedb_graph.config import (
     DEFAULT_COMMUNITY_INTRA_RATIO,
@@ -28,8 +31,25 @@ def build_node_ids(num_nodes: int, num_node_types: int):
     return node_ids
 
 
+def build_shuffled_node_indices(num_nodes: int, seed: int):
+    indices = array("I", range(num_nodes))
+    rng = random.Random(seed)
+    for idx in range(num_nodes - 1, 0, -1):
+        swap_idx = rng.randrange(idx + 1)
+        indices[idx], indices[swap_idx] = indices[swap_idx], indices[idx]
+    return indices
+
+
 def build_relation_names(num_relations: int):
     return [f"rel_{idx}" for idx in range(num_relations)]
+
+
+def build_relation_bytes(num_relations: int) -> List[bytes]:
+    return [f"rel_{idx}".encode("utf-8") for idx in range(num_relations)]
+
+
+def build_node_type_bytes(num_node_types: int) -> List[bytes]:
+    return [f"type{idx}".encode("utf-8") for idx in range(num_node_types)]
 
 
 def choose_uniform_edge(node_ids, relation_names, rng):
@@ -63,6 +83,47 @@ def build_node_community_map(node_ids, num_communities: int):
     return node_community_map
 
 
+def node_type_for_index(node_index: int, num_node_types: int) -> str:
+    return f"type{node_index % num_node_types}"
+
+
+def node_id_for_index(node_index: int, num_node_types: int) -> str:
+    node_type = node_type_for_index(node_index, num_node_types)
+    return f"{node_type}:node_{node_index}"
+
+
+def node_fields_for_index(node_index: int, num_node_types: int) -> Tuple[str, str]:
+    node_type = f"type{node_index % num_node_types}"
+    return node_type, f"{node_type}:node_{node_index}"
+
+
+def write_edge_line(
+    handle,
+    src_index: int,
+    dst_index: int,
+    relation_index: int,
+    num_node_types: int,
+    node_type_bytes: List[bytes],
+    relation_bytes: List[bytes],
+):
+    src_type = node_type_bytes[src_index % num_node_types]
+    dst_type = node_type_bytes[dst_index % num_node_types]
+    handle.write(src_type)
+    handle.write(b"\t")
+    handle.write(src_type)
+    handle.write(b":node_")
+    handle.write(str(src_index).encode("ascii"))
+    handle.write(b"\t")
+    handle.write(relation_bytes[relation_index])
+    handle.write(b"\t")
+    handle.write(dst_type)
+    handle.write(b"\t")
+    handle.write(dst_type)
+    handle.write(b":node_")
+    handle.write(str(dst_index).encode("ascii"))
+    handle.write(b"\n")
+
+
 def choose_community_edge(node_ids, relation_names, communities, intra_ratio: float, rng):
     # 以较高概率在同一社区内采样边，制造“社区内稠密、社区间稀疏”的结构。
     if rng.random() < intra_ratio:
@@ -76,6 +137,37 @@ def choose_community_edge(node_ids, relation_names, communities, intra_ratio: fl
         dst_type, dst_id = rng.choice(node_ids)
     relation = rng.choice(relation_names)
     return src_type, src_id, relation, dst_type, dst_id
+
+
+def choose_community_edge_from_indices(indices, relation_names, num_node_types, num_communities, intra_ratio: float, rng):
+    if rng.random() < intra_ratio:
+        community_id = rng.randrange(num_communities)
+        src_index = indices[community_id + num_communities * rng.randrange(max(1, len(indices) // num_communities))]
+        dst_index = indices[community_id + num_communities * rng.randrange(max(1, len(indices) // num_communities))]
+    else:
+        src_index = indices[rng.randrange(len(indices))]
+        dst_index = indices[rng.randrange(len(indices))]
+
+    src_type = node_type_for_index(src_index, num_node_types)
+    dst_type = node_type_for_index(dst_index, num_node_types)
+    src_id = f"{src_type}:node_{src_index}"
+    dst_id = f"{dst_type}:node_{dst_index}"
+    relation = rng.choice(relation_names)
+    return src_type, src_id, relation, dst_type, dst_id
+
+
+def build_position_to_community(num_nodes: int, num_communities: int) -> array:
+    community_ids = array("I", [0]) * num_nodes
+    for position in range(num_nodes):
+        community_ids[position] = position % num_communities
+    return community_ids
+
+
+def build_community_positions(num_nodes: int, num_communities: int):
+    community_positions = [[] for _ in range(num_communities)]
+    for position in range(num_nodes):
+        community_positions[position % num_communities].append(position)
+    return community_positions
 
 
 def generate_edges(
@@ -113,6 +205,92 @@ def generate_edges(
             raise ValueError(f"不支持的 graph_mode: {graph_mode}")
         edges.append(edge)
     return edges, node_community_map
+
+
+def stream_generate_graph(
+    graph_mode: str,
+    num_nodes: int,
+    num_edges: int,
+    num_relations: int,
+    num_node_types: int,
+    seed: int,
+    num_communities: int,
+    intra_ratio: float,
+    output_path: str,
+):
+    """流式生成图 TSV，避免将所有边保存在内存中。"""
+    rng = random.Random(seed)
+    shuffled_indices = build_shuffled_node_indices(num_nodes, seed)
+    relation_names = build_relation_names(num_relations)
+    relation_bytes = build_relation_bytes(num_relations)
+    node_type_bytes = build_node_type_bytes(num_node_types)
+    position_to_community = build_position_to_community(num_nodes, num_communities)
+    community_positions = build_community_positions(num_nodes, num_communities) if graph_mode == "community" else None
+    degree_out = Counter()
+    degree_in = Counter()
+
+    ensure_parent_dir(output_path)
+    with open(output_path, "wb") as f:
+        f.write(b"head_type\thead\trelation\ttail_type\ttail\n")
+
+        for _ in range(num_edges):
+            if graph_mode == "uniform":
+                src_index = shuffled_indices[rng.randrange(num_nodes)]
+                dst_index = shuffled_indices[rng.randrange(num_nodes)]
+                relation_index = rng.randrange(num_relations)
+            elif graph_mode == "powerlaw":
+                src_index = shuffled_indices[int(rng.random() ** 2 * num_nodes)]
+                dst_index = shuffled_indices[int(rng.random() ** 2 * num_nodes)]
+                relation_index = rng.randrange(num_relations)
+            elif graph_mode == "community":
+                if rng.random() < intra_ratio:
+                    community_id = rng.randrange(num_communities)
+                    positions = community_positions[community_id]
+                    src_position = positions[rng.randrange(len(positions))]
+                    dst_position = positions[rng.randrange(len(positions))]
+                else:
+                    src_position = rng.randrange(num_nodes)
+                    dst_position = rng.randrange(num_nodes)
+                src_index = shuffled_indices[src_position]
+                dst_index = shuffled_indices[dst_position]
+                relation_index = rng.randrange(num_relations)
+            else:
+                raise ValueError(f"不支持的 graph_mode: {graph_mode}")
+
+            src_id = f"type{src_index % num_node_types}:node_{src_index}"
+            dst_id = f"type{dst_index % num_node_types}:node_{dst_index}"
+            degree_out[src_id] += 1
+            degree_in[dst_id] += 1
+            write_edge_line(
+                f,
+                src_index,
+                dst_index,
+                relation_index,
+                num_node_types,
+                node_type_bytes,
+                relation_bytes,
+            )
+
+    community_path = None
+    node_community_map = None
+    if graph_mode == "community":
+        node_community_map = {
+            node_id_for_index(node_index, num_node_types): position_to_community[position]
+            for position, node_index in enumerate(shuffled_indices)
+        }
+        community_path = write_node_communities_json(output_path, node_community_map)
+
+    return {
+        "output_path": output_path,
+        "community_path": community_path,
+        "num_nodes": num_nodes,
+        "num_edges": num_edges,
+        "num_relations": num_relations,
+        "num_node_types": num_node_types,
+        "degree_out": degree_out,
+        "degree_in": degree_in,
+        "node_community_map": node_community_map,
+    }
 
 
 def write_edges_tsv(output_path: str, edges):
@@ -156,7 +334,7 @@ def main():
     args = parser.parse_args()
 
     output_path = args.output_path or default_output_path(args.graph_mode, args.num_edges)
-    edges, node_community_map = generate_edges(
+    result = stream_generate_graph(
         graph_mode=args.graph_mode,
         num_nodes=args.num_nodes,
         num_edges=args.num_edges,
@@ -165,19 +343,16 @@ def main():
         seed=args.seed,
         num_communities=args.num_communities,
         intra_ratio=args.intra_ratio,
+        output_path=output_path,
     )
-    write_edges_tsv(output_path, edges)
-    community_path = None
-    if args.graph_mode == "community":
-        community_path = write_node_communities_json(output_path, node_community_map)
 
     print("图数据生成完成")
     print(f"graph_mode: {args.graph_mode}")
     print(f"num_nodes: {args.num_nodes}")
     print(f"num_edges: {args.num_edges}")
     print(f"output_path: {output_path}")
-    if community_path:
-        print(f"community_path: {community_path}")
+    if result["community_path"]:
+        print(f"community_path: {result['community_path']}")
 
 
 if __name__ == "__main__":

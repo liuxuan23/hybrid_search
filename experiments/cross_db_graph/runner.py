@@ -124,6 +124,32 @@ def execute_benchmark(adapter, workloads):
     return results
 
 
+def execute_coldish_benchmark(engine: str, workloads, materialize: bool | None = None):
+    results = []
+
+    for workload in workloads:
+        adapter = build_adapter(engine, materialize=materialize)
+        adapter.connect()
+        try:
+            results.append(run_workload(adapter, workload))
+        except Exception as exc:
+            results.append(
+                BenchmarkResult(
+                    engine=adapter.engine_name,
+                    query_type=getattr(workload, "query_type", "unknown"),
+                    seed=getattr(workload, "seed", ""),
+                    k=getattr(workload, "k", 0),
+                    batch_size=len(getattr(workload, "seeds", [])) if hasattr(workload, "seeds") else 0,
+                    success=False,
+                    error_message=str(exc),
+                )
+            )
+        finally:
+            adapter.close()
+
+    return results
+
+
 def write_results(results):
     config.RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -156,6 +182,12 @@ def parse_args():
         default=None,
         help="Override query materialization mode for the selected engine",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["warm", "coldish"],
+        default="warm",
+        help="Benchmark execution mode: reuse one connection for warm mode, or use a fresh connection per workload for coldish mode",
+    )
     return parser.parse_args()
 
 
@@ -165,6 +197,12 @@ def main():
     workloads = build_default_workloads(single_seeds, batch_seeds)
     print(f"Loaded {len(workloads)} workloads from {config.SEEDS_FILE}")
     materialize = None if args.materialize is None else args.materialize == "true"
+    if args.mode == "coldish":
+        results = execute_coldish_benchmark(args.engine, workloads, materialize=materialize)
+        output_dir = write_results(results)
+        print(f"Completed {args.engine} benchmark run in coldish mode. Results written to {output_dir}")
+        return
+
     adapter = build_adapter(args.engine, materialize=materialize)
     adapter.connect()
     try:
@@ -173,7 +211,7 @@ def main():
     finally:
         adapter.close()
 
-    print(f"Completed {adapter.engine_name} benchmark run. Results written to {output_dir}")
+    print(f"Completed {adapter.engine_name} benchmark run in warm mode. Results written to {output_dir}")
 
 
 if __name__ == "__main__":

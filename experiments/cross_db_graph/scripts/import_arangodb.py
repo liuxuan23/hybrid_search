@@ -5,7 +5,11 @@ from pathlib import Path
 from arango import ArangoClient
 
 from experiments.cross_db_graph import config
-from experiments.lancedb_graph.data_prep.build_graph_tables import build_graph_dataframes_from_tsv
+from experiments.lancedb_graph.data_prep.build_graph_tables import (
+    batched,
+    build_node_records_from_tsv,
+    iter_edge_records_from_tsv,
+)
 
 VERTEX_COLLECTION = "graph_nodes"
 EDGE_COLLECTION = "graph_edges"
@@ -51,41 +55,37 @@ def truncate_collections(db):
     db.collection(VERTEX_COLLECTION).truncate()
 
 
-def _to_vertex_docs(nodes_df):
-    docs = []
-    for row in nodes_df.itertuples(index=False):
-        docs.append(
-            {
-                "_key": str(row.node_id),
-                "node_id": str(row.node_id),
-                "node_type": row.node_type,
-                "degree_out": int(row.degree_out),
-                "degree_in": int(row.degree_in),
-                "community_id": str(row.community_id),
-                "attrs_json": json.loads(row.attrs_json),
-            }
-        )
-    return docs
+def _to_vertex_docs(node_records):
+    return [
+        {
+            "_key": str(row.node_id),
+            "node_id": str(row.node_id),
+            "node_type": row.node_type,
+            "degree_out": int(row.degree_out),
+            "degree_in": int(row.degree_in),
+            "community_id": str(row.community_id),
+            "attrs_json": json.loads(row.attrs_json),
+        }
+        for row in node_records
+    ]
 
 
-def _to_edge_docs(edges_df):
-    docs = []
-    for row in edges_df.itertuples(index=False):
-        docs.append(
-            {
-                "_key": str(row.edge_id),
-                "_from": f"{VERTEX_COLLECTION}/{row.src_id}",
-                "_to": f"{VERTEX_COLLECTION}/{row.dst_id}",
-                "edge_id": str(row.edge_id),
-                "src_id": str(row.src_id),
-                "dst_id": str(row.dst_id),
-                "edge_type": row.edge_type,
-                "src_type": row.src_type,
-                "dst_type": row.dst_type,
-                "attrs_json": json.loads(row.attrs_json),
-            }
-        )
-    return docs
+def _to_edge_docs(edge_records):
+    return [
+        {
+            "_key": str(row.edge_id),
+            "_from": f"{VERTEX_COLLECTION}/{row.src_id}",
+            "_to": f"{VERTEX_COLLECTION}/{row.dst_id}",
+            "edge_id": str(row.edge_id),
+            "src_id": str(row.src_id),
+            "dst_id": str(row.dst_id),
+            "edge_type": row.edge_type,
+            "src_type": row.src_type,
+            "dst_type": row.dst_type,
+            "attrs_json": json.loads(row.attrs_json),
+        }
+        for row in edge_records
+    ]
 
 
 def _import_in_batches(collection, docs, batch_size: int = 5000):
@@ -96,18 +96,16 @@ def _import_in_batches(collection, docs, batch_size: int = 5000):
 
 
 def import_tsv_to_arangodb(tsv_path: Path, url: str, db_name: str, username: str, password: str):
-    nodes_df, edges_df = build_graph_dataframes_from_tsv(str(tsv_path))
+    node_records = build_node_records_from_tsv(str(tsv_path))
 
     client = ArangoClient(hosts=url)
     db = _ensure_database(client, db_name, username, password)
     ensure_schema(db)
     truncate_collections(db)
 
-    vertex_docs = _to_vertex_docs(nodes_df)
-    edge_docs = _to_edge_docs(edges_df)
-
-    _import_in_batches(db.collection(VERTEX_COLLECTION), vertex_docs)
-    _import_in_batches(db.collection(EDGE_COLLECTION), edge_docs)
+    _import_in_batches(db.collection(VERTEX_COLLECTION), _to_vertex_docs(node_records))
+    for chunk in batched(iter_edge_records_from_tsv(str(tsv_path)), batch_size=5000):
+        _import_in_batches(db.collection(EDGE_COLLECTION), _to_edge_docs(chunk))
 
 
 def main():

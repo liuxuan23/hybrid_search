@@ -1,4 +1,6 @@
 import json
+from collections import Counter
+from pathlib import Path
 
 from experiments.cross_db_graph import config
 from experiments.lancedb_graph.storage_models.lancedb_graph_adjacency import (
@@ -53,6 +55,59 @@ def generate_seeds(sample_size_per_bucket=10, batch_size=None):
     }
 
     with open(config.SEEDS_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    return payload
+
+
+def generate_seeds_from_tsv(tsv_path: Path, sample_size_per_bucket=10, batch_size=None, output_path=None):
+    degree_out = Counter()
+    degree_in = Counter()
+
+    with open(tsv_path, "r", encoding="utf-8") as f:
+        header = next(f, None)
+        if header is None:
+            raise ValueError(f"TSV file is empty: {tsv_path}")
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 5:
+                continue
+            _head_type, head, _relation, _tail_type, tail = parts
+            degree_out[head] += 1
+            degree_in[tail] += 1
+
+    node_ids = sorted(set(degree_out) | set(degree_in))
+    if not node_ids:
+        raise ValueError(f"No nodes found in TSV: {tsv_path}")
+
+    rows = []
+    for node_id in node_ids:
+        total = degree_out.get(node_id, 0) + degree_in.get(node_id, 0)
+        rows.append((total, node_id))
+    rows.sort(key=lambda item: (item[0], item[1]))
+
+    n = len(rows)
+    low_rows = rows[: max(1, n // 3)]
+    medium_rows = rows[max(1, n // 3) : max(2, (2 * n) // 3)]
+    high_rows = rows[max(2, (2 * n) // 3) :]
+
+    low_degree = _pick_evenly_spaced([node_id for _deg, node_id in low_rows], sample_size_per_bucket)
+    medium_degree = _pick_evenly_spaced([node_id for _deg, node_id in medium_rows], sample_size_per_bucket)
+    high_degree = _pick_evenly_spaced([node_id for _deg, node_id in high_rows], sample_size_per_bucket)
+
+    combined = low_degree + medium_degree + high_degree
+    batch_size = batch_size or min(config.DEFAULT_BATCH_SIZE, len(combined))
+    batch_seed_set = combined[:batch_size]
+
+    payload = {
+        "low_degree": low_degree,
+        "medium_degree": medium_degree,
+        "high_degree": high_degree,
+        "batch_seed_set": batch_seed_set,
+    }
+
+    destination = Path(output_path) if output_path else config.SEEDS_FILE
+    with open(destination, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
     return payload
