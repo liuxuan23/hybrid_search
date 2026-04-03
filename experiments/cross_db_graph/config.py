@@ -14,6 +14,12 @@ LANCEDB_DB_PATH = Path(
 		str(BASE_DIR.parent.parent / "storage" / "lancedb_graph" / "cross_db_graph_benchmark"),
 	)
 )
+LANCE_GRAPH_DB_PATH = Path(
+	os.environ.get(
+		"LANCE_GRAPH_DB_PATH",
+		str(BASE_DIR.parent.parent / "storage" / "lance_graph" / "cross_db_graph_benchmark"),
+	)
+)
 
 WARMUP_RUNS = 1
 MEASURE_RUNS = 3
