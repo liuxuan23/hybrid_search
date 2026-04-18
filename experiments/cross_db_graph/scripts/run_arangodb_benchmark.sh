@@ -2,13 +2,22 @@
 
 set -euo pipefail
 
-ROOT_DIR="/home/liuxuan/workplace/hybrid_search"
-PYTHON_BIN="/home/liuxuan/workplace/.venv/bin/python"
-DEFAULT_TSV_PATH="/data/dataset/graph_data/cluster/synthetic_community_100000.tsv"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-uv run python}"
+DEFAULT_TSV_PATH="$ROOT_DIR/data/cluster/synthetic_community_1000000.tsv"
 DEFAULT_ARANGODB_URL="http://127.0.0.1:8529"
 DEFAULT_ARANGODB_DB="graph_bench"
 DEFAULT_ARANGODB_USERNAME="root"
 DEFAULT_ARANGODB_PASSWORD=""
+
+run_python() {
+	if [[ "$PYTHON_BIN" == "uv run python" ]]; then
+		uv run python "$@"
+	else
+		"$PYTHON_BIN" "$@"
+	fi
+}
 
 cleanup() {
   echo "[cleanup] Dropping ArangoDB benchmark collections and graph ..."
@@ -16,7 +25,7 @@ cleanup() {
   ARANGODB_DB="$ARANGODB_DB" \
   ARANGODB_USERNAME="$ARANGODB_USERNAME" \
   ARANGODB_PASSWORD="$ARANGODB_PASSWORD" \
-  "$PYTHON_BIN" - <<'PY'
+  run_python - <<'PY'
 import os
 
 from arango import ArangoClient
@@ -50,6 +59,12 @@ ARANGODB_DB="${3:-$DEFAULT_ARANGODB_DB}"
 ARANGODB_USERNAME="${4:-$DEFAULT_ARANGODB_USERNAME}"
 ARANGODB_PASSWORD="${5:-$DEFAULT_ARANGODB_PASSWORD}"
 
+if [[ ! -f "$TSV_PATH" ]]; then
+  echo "TSV file not found: $TSV_PATH" >&2
+  echo "Tip: pass an explicit TSV path, e.g. $ROOT_DIR/data/cluster/synthetic_community_1000000.tsv" >&2
+  exit 1
+fi
+
 trap cleanup EXIT
 
 echo "Running full ArangoDB benchmark pipeline ..."
@@ -64,7 +79,7 @@ ARANGODB_URL="$ARANGODB_URL" \
 ARANGODB_DB="$ARANGODB_DB" \
 ARANGODB_USERNAME="$ARANGODB_USERNAME" \
 ARANGODB_PASSWORD="$ARANGODB_PASSWORD" \
-"$PYTHON_BIN" -m experiments.cross_db_graph.scripts.import_arangodb "$TSV_PATH"
+run_python -m experiments.cross_db_graph.scripts.import_arangodb "$TSV_PATH"
 
 echo "[2/2] Running ArangoDB benchmark ..."
 PYTHONPATH="$ROOT_DIR" \
@@ -72,6 +87,6 @@ ARANGODB_URL="$ARANGODB_URL" \
 ARANGODB_DB="$ARANGODB_DB" \
 ARANGODB_USERNAME="$ARANGODB_USERNAME" \
 ARANGODB_PASSWORD="$ARANGODB_PASSWORD" \
-"$PYTHON_BIN" -m experiments.cross_db_graph.runner --engine arangodb
+run_python -m experiments.cross_db_graph.runner --engine arangodb
 
 echo "Done. Check results under experiments/cross_db_graph/results/"

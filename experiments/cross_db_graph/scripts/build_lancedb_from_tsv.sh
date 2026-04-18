@@ -2,20 +2,35 @@
 
 set -euo pipefail
 
-ROOT_DIR="/home/liuxuan/workplace/hybrid_search"
-PYTHON_BIN="/home/liuxuan/workplace/.venv/bin/python"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd -- "$SCRIPT_DIR/../../.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-uv run python}"
 
-TSV_PATH="${1:-/data/dataset/graph_data/triples.tsv}"
-DB_PATH="${2:-/home/liuxuan/workplace/hybrid_search/storage/lancedb_graph/cross_db_graph_benchmark}"
-CLUSTER_STRATEGY="${3:-by_node_type}"
+TSV_PATH="${1:-$ROOT_DIR/data/cluster/synthetic_community_1000000.tsv}"
+DB_PATH="${2:-$ROOT_DIR/storage/lancedb_graph/cross_db_graph_benchmark}"
+CLUSTER_STRATEGY="${3:-community}"
+
+run_python() {
+	if [[ "$PYTHON_BIN" == "uv run python" ]]; then
+		uv run python "$@"
+	else
+		"$PYTHON_BIN" "$@"
+	fi
+}
 
 echo "Building LanceDB graph storage from TSV ..."
 echo "  tsv_path          = $TSV_PATH"
 echo "  db_path           = $DB_PATH"
 echo "  cluster_strategy  = $CLUSTER_STRATEGY"
 
+if [[ ! -f "$TSV_PATH" ]]; then
+	echo "TSV file not found: $TSV_PATH" >&2
+	echo "Tip: pass an explicit TSV path, e.g. $ROOT_DIR/data/cluster/synthetic_community_1000000.tsv" >&2
+	exit 1
+fi
+
 cd "$ROOT_DIR"
-PYTHONPATH="$ROOT_DIR" "$PYTHON_BIN" - <<PY
+PYTHONPATH="$ROOT_DIR" run_python - <<PY
 from experiments.lancedb_graph.storage_models.lancedb_graph_adjacency import LanceDBGraphAdjacency
 
 tsv_path = r"$TSV_PATH"
