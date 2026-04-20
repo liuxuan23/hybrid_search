@@ -31,6 +31,9 @@ POSTGRES_DSN = os.environ.get(
 	"POSTGRES_DSN",
 	"postgresql://postgres:postgres123@localhost:5432/graph_bench",
 )
+POSTGRES_AGE_GRAPH = os.environ.get("POSTGRES_AGE_GRAPH", "graph_bench_age")
+POSTGRES_AGE_VERTEX_LABEL = os.environ.get("POSTGRES_AGE_VERTEX_LABEL", "Node")
+POSTGRES_AGE_EDGE_LABEL = os.environ.get("POSTGRES_AGE_EDGE_LABEL", "EDGE")
 ARANGODB_URL = os.environ.get("ARANGODB_URL", "http://127.0.0.1:8529")
 ARANGODB_DB = os.environ.get("ARANGODB_DB", "graph_bench")
 ARANGODB_USERNAME = os.environ.get("ARANGODB_USERNAME", "root")

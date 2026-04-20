@@ -81,6 +81,7 @@
 - `lancedb`
 - `lance_graph`
 - `postgres`
+- `postgres_age`
 - `arangodb`
 
 补充参数：
@@ -132,6 +133,50 @@
 
 - 该脚本适合“一次性导入 + 测试 + 清理”的 benchmark 流程
 - 如果需要保留 PostgreSQL 数据做进一步排查或手工分析，需要临时去掉脚本中的 `trap cleanup EXIT`
+
+### `import_postgres_age.py`
+
+作用：
+
+1. 将 TSV 图数据转换为 AGE 原生 `load_labels_from_file` / `load_edges_from_file` 所需 CSV
+2. 自动重建 AGE graph 与 label
+3. 使用 Apache AGE 批量导入函数完成高性能导入
+
+默认参数：
+
+- PostgreSQL DSN：`postgresql://postgres:postgres123@localhost:5432/graph_bench`
+- Graph 名称：`graph_bench_age`
+- Vertex label：`Node`
+- Edge label：`EDGE`
+
+说明：
+
+- 需要 PostgreSQL 已安装并启用 `age` extension
+- 当前导入链路已从逐批 Cypher `UNWIND CREATE` 切换为 AGE 原生批量导入
+- 边导入默认按 `edge_chunk_size=100000` 分块调用 `load_edges_from_file`，避免大图单次导入触发 PostgreSQL 进程 OOM
+
+### `run_postgres_age_benchmark.sh`
+
+作用：
+
+1. 调用 `import_postgres_age.py` 导入 AGE 图数据
+2. 执行一次 `postgres_age` benchmark
+3. 脚本退出时自动清理 AGE graph
+
+默认参数：
+
+- TSV 路径：`/data/dataset/graph_data/cluster/synthetic_community_100000.tsv`
+- PostgreSQL DSN：`postgresql://postgres:postgres123@localhost:5432/graph_bench`
+- Graph 名称：`graph_bench_age`
+
+自动清理行为：
+
+- 脚本退出时会自动删除 AGE graph（默认 `graph_bench_age`）
+
+说明：
+
+- 该脚本适合“一次性导入 + 测试 + 清理”的 AGE benchmark 流程
+- 如需保留 graph 做进一步分析，可临时移除脚本中的 `trap cleanup EXIT`
 
 ### `run_arangodb_benchmark.sh`
 
@@ -187,6 +232,12 @@
 - `import_postgres.py`
   - PostgreSQL 数据导入脚本
 
+- `import_postgres_age.py`
+  - PostgreSQL Apache AGE 图导入脚本
+
+- `run_postgres_age_benchmark.sh`
+  - 一键执行 PostgreSQL AGE 导入、benchmark 与自动清理
+
 - `run_postgres_benchmark.sh`
   - 一键执行 PostgreSQL 导入、benchmark 与自动清理
 
@@ -229,6 +280,7 @@
 如果要跑 PostgreSQL 或 ArangoDB，一般直接执行：
 
 - `experiments/cross_db_graph/scripts/run_postgres_benchmark.sh`
+- `experiments/cross_db_graph/scripts/run_postgres_age_benchmark.sh`
 - `experiments/cross_db_graph/scripts/run_arangodb_benchmark.sh`
 
 注意：

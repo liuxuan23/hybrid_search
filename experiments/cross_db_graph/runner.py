@@ -40,6 +40,18 @@ def build_postgres_adapter(materialize: bool = False):
     return PostgresGraphAdapter(dsn=config.POSTGRES_DSN, materialize=materialize)
 
 
+def build_postgres_age_adapter(materialize: bool = False):
+    from experiments.cross_db_graph.adapters.postgres_age_adapter import PostgresAGEGraphAdapter
+
+    return PostgresAGEGraphAdapter(
+        dsn=config.POSTGRES_DSN,
+        graph_name=config.POSTGRES_AGE_GRAPH,
+        vertex_label=config.POSTGRES_AGE_VERTEX_LABEL,
+        edge_label=config.POSTGRES_AGE_EDGE_LABEL,
+        materialize=materialize,
+    )
+
+
 def build_arangodb_adapter(materialize: bool = False):
     from experiments.cross_db_graph.adapters.arangodb_adapter import ArangoDBGraphAdapter
 
@@ -60,6 +72,8 @@ def build_adapter(engine: str, materialize: bool | None = None):
         return build_lance_graph_adapter(materialize=False if materialize is None else materialize)
     if engine == "postgres":
         return build_postgres_adapter(materialize=False if materialize is None else materialize)
+    if engine == "postgres_age":
+        return build_postgres_age_adapter(materialize=False if materialize is None else materialize)
     if engine == "arangodb":
         return build_arangodb_adapter(materialize=False if materialize is None else materialize)
     raise ValueError(f"Unsupported engine: {engine}")
@@ -224,7 +238,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run cross-db graph benchmark")
     parser.add_argument(
         "--engine",
-        choices=["lancedb", "lance_graph", "postgres", "arangodb"],
+        choices=["lancedb", "lance_graph", "postgres", "postgres_age", "arangodb"],
         default="lancedb",
         help="Which backend engine to benchmark",
     )
